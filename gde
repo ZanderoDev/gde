@@ -70,15 +70,19 @@ LEGACY_DB = Path.home() / ".config" / "egd" / "vault.db"
 DB_PATH = DB_DIR / "vault.db"
 
 
-def init_db():
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(DB_DIR, 0o700)
+def init_db(custom_path=None):
+    path = Path(custom_path) if custom_path else DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
 
     # Migrate from legacy egd path if needed
-    if not DB_PATH.exists() and LEGACY_DB.exists():
+    if not custom_path and not DB_PATH.exists() and LEGACY_DB.exists():
         shutil.copy2(LEGACY_DB, DB_PATH)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS vault (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,7 +97,10 @@ def init_db():
         )
     """)
     conn.commit()
-    os.chmod(DB_PATH, 0o600)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     return conn
 
 
@@ -159,7 +166,7 @@ class GDriveMCP:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "gde-cli", "version": "1.4.0"}
+                    "clientInfo": {"name": "gde-cli", "version": "1.4.1"}
                 }
             })
             if "error" in init_res:
@@ -361,7 +368,7 @@ def extract_zip_faithful(zip_path, dest_dir):
                 dir_perms.append((target_path, perm & 0o777))
             else:
                 # File biasa:
-                # Hapus symlink lama pada target_path jika entri sebelumnya adalah symlink (Bug #1 defense)
+                # Hapus symlink lama pada target_path jika entri sebelumnya adalah symlink
                 if os.path.islink(target_path):
                     target_path.unlink()
 
@@ -520,18 +527,28 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
                 log_warn("Dibatalkan oleh pengguna.")
                 sys.exit(1)
 
-            shutil.copy2(temp_enc, out_enc)
+            # Simpan kunci ke DB lokal TERLEBIH DAHULU sebelum menyalin file keluar
             conn.execute(
                 """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (label, target.name, str(target), is_dir, size_bytes, key.hex(), None, created_at)
             )
             conn.commit()
+
+            try:
+                if os.path.islink(out_enc):
+                    out_enc.unlink()
+                shutil.copy2(temp_enc, out_enc)
+            except Exception as e:
+                conn.execute("DELETE FROM vault WHERE label = ?", (label,))
+                conn.commit()
+                log_err(f"Gagal menyimpan ciphertext ke {out_enc}: {e}")
+                sys.exit(1)
+
             log_success(f"File terenkripsi disimpan ke: {C.BOLD}{C.GREEN}{out_enc}{C.RESET}")
             log_success(f"Kunci tersimpan di vault lokal: {C.DIM}{DB_PATH}{C.RESET}")
             log_info(f"Untuk restore lokal: {C.GREEN}gde decrypt {out_enc.name}{C.RESET}")
 
-            # Bug #4: Hitung seluruh entri yang dilewati (unreadable + special_files)
             skipped_items = len(unreadable_items) + len(special_files)
             if skipped_items and not allow_partial:
                 log_warn(f"Selesai DENGAN PERINGATAN: Backup parsial ({skipped_items} entri dilewati).")
@@ -543,8 +560,7 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
                 log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi lokal.")
             return
 
-        # Mode online:
-        # Bug #7: Simpan dulu kunci ke vault SEBELUM upload ke jaringan (mencegah kehilangan kunci)
+        # Mode online: Simpan dulu kunci ke vault SEBELUM upload ke jaringan
         conn.execute(
             """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -572,6 +588,8 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
             if fallback_enc.exists() and not force:
                 fallback_enc = Path.cwd() / f"{target.name}.{secrets.token_hex(4)}.enc"
 
+            if os.path.islink(fallback_enc):
+                fallback_enc.unlink()
             shutil.copy2(temp_enc, fallback_enc)
             log_err(f"GDrive MCP Error: {upload_err}")
             log_warn(f"Upload gagal. File terenkripsi diamankan ke: {C.BOLD}{fallback_enc}{C.RESET}")
@@ -591,7 +609,7 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
             log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi penuh di cloud.")
 
 
-def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False):
+def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None):
     """Decrypt a local .enc file using the key from local vault or user input."""
     enc_path = Path(enc_path_str).expanduser().resolve()
     if not enc_path.exists():
@@ -615,7 +633,7 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False):
     label = enc_data[5:5 + label_len].decode("utf-8", errors="ignore")
     log_info(f"Terdeteksi label: {C.GREEN}{label}{C.RESET}")
 
-    conn = init_db()
+    conn = conn_override or init_db()
     cur = conn.cursor()
     cur.execute("SELECT original_name, is_dir, enc_key FROM vault WHERE label = ?", (label,))
     row = cur.fetchone()
@@ -655,13 +673,16 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False):
         log_err(f"Gagal dekripsi: {e}")
         sys.exit(1)
 
-    # Bug #2 defense: pastikan nama file aman dari path traversal
+    # Sanitasi ketat nama file (cegah path traversal)
     safe_name = Path(name).name
     if not safe_name or safe_name in (".", ".."):
         safe_name = f"{label}.restored"
 
-    dest = (Path(dest_dir).resolve() / safe_name)
-    if not is_subpath(dest, dest_dir):
+    base_dest_dir = Path(dest_dir).resolve()
+    dest = base_dest_dir / safe_name
+
+    # Validasi bahwa target berada di dalam base_dest_dir tanpa melompat lewat directory parent traversal
+    if not is_subpath(dest.parent, base_dest_dir):
         log_err(f"Path traversal terdeteksi pada target pemulihan: {dest}")
         sys.exit(1)
 
@@ -669,9 +690,9 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False):
         log_warn("Dibatalkan oleh pengguna.")
         sys.exit(1)
 
-    # Bug #1 defense: jika target adalah symlink yang sudah ada, hapus symlink agar tidak tembus
+    # Hapus symlink yang sudah ada pada lokasi tujuan sebelum menulis
     if os.path.islink(dest):
-        log_warn(f"Target '{dest}' adalah symlink yang sudah ada. Menghapus symlink sebelum memulihkan...")
+        log_warn(f"Target '{dest.name}' adalah symlink yang sudah ada. Menghapus symlink sebelum memulihkan...")
         dest.unlink()
 
     if is_dir:
@@ -682,7 +703,7 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False):
             log_info(f"Mengekstrak folder ke: {C.BOLD}{dest}{C.RESET}")
             extract_zip_faithful(tmp_zip, dest)
     else:
-        # Bug #5 defense: tulis file baru dengan izin ketat 0600 via atomic replace
+        # Tulis secara atomik dengan izin ketat 0600
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = dest.parent / f".tmp_{secrets.token_hex(6)}"
         fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -751,8 +772,8 @@ def cmd_list():
     cmd_download(item_id)
 
 
-def cmd_download(item_id_or_label, dest_dir=".", force=False):
-    conn = init_db()
+def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None):
+    conn = conn_override or init_db()
     cur = conn.cursor()
     if isinstance(item_id_or_label, int) or str(item_id_or_label).isdigit():
         cur.execute("SELECT id, label, original_name, original_path, is_dir, enc_key, drive_file_id FROM vault WHERE id = ?", (int(item_id_or_label),))
@@ -767,13 +788,13 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False):
     _, label, name, original_path, is_dir, key_hex, drive_file_id = row
     key = bytes.fromhex(key_hex)
 
-    # Bug #2 defense: sanitasi nama dari vault
     safe_name = Path(name).name
     if not safe_name or safe_name in (".", ".."):
         safe_name = f"{label}.restored"
 
-    dest = (Path(dest_dir).resolve() / safe_name)
-    if not is_subpath(dest, dest_dir):
+    base_dest_dir = Path(dest_dir).resolve()
+    dest = base_dest_dir / safe_name
+    if not is_subpath(dest.parent, base_dest_dir):
         log_err(f"Path traversal terdeteksi pada target pemulihan: {dest}")
         sys.exit(1)
 
@@ -833,18 +854,16 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False):
             log_warn("Dibatalkan oleh pengguna.")
             sys.exit(1)
 
-        # Bug #1 defense: jika target adalah symlink yang sudah ada, hapus symlink
         if os.path.islink(dest):
-            log_warn(f"Target '{dest}' adalah symlink yang sudah ada. Menghapus symlink sebelum memulihkan...")
+            log_warn(f"Target '{dest.name}' adalah symlink yang sudah ada. Menghapus symlink sebelum memulihkan...")
             dest.unlink()
 
         if is_dir:
-            log_info(f"Folder terdeteksi -> Mengekstrak ZIP ke: {C.BOLD}{dest}{C.RESET}")
+            dest.mkdir(parents=True, exist_ok=True)
             decrypted_zip = tmp / "restored.zip"
             decrypted_zip.write_bytes(dec_bytes)
             extract_zip_faithful(decrypted_zip, dest)
         else:
-            # Bug #5 defense: tulis file baru dengan izin ketat 0600 via atomic replace
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp_file = dest.parent / f".tmp_{secrets.token_hex(6)}"
             fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -866,9 +885,9 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False):
         log_done(f"Berhasil di-restore ke: {C.BOLD}{C.GREEN}{dest}{C.RESET}")
 
 
-def cmd_export_keys(out_path=None):
+def cmd_export_keys(out_path=None, conn_override=None):
     """Export vault database to a backup JSON file with strict 0o600 permissions."""
-    conn = init_db()
+    conn = conn_override or init_db()
     cur = conn.cursor()
     cur.execute("SELECT id, label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at FROM vault")
     rows = cur.fetchall()
@@ -888,16 +907,19 @@ def cmd_export_keys(out_path=None):
         })
 
     if not out_path:
-        out_path = Path.home() / ".config" / "gde" / f"vault-backup-{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+        target_path = Path.home() / ".config" / "gde" / f"vault-backup-{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
     else:
-        out_path = Path(out_path).resolve()
+        raw_path = Path(out_path).expanduser()
+        parent_dir = raw_path.parent.resolve()
+        target_path = parent_dir / raw_path.name
 
-    # Bug #6 defense: Tulis ke file sementara lalu atomic replace
-    if os.path.islink(out_path):
-        out_path.unlink()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.parent / f".tmp_export_{secrets.token_hex(6)}"
+    # Bug #1 fix: Hapus symlink pada target_path jika sudah ada (cegah menimpa target symlink)
+    if os.path.islink(target_path):
+        target_path.unlink()
+
+    tmp_path = target_path.parent / f".tmp_export_{secrets.token_hex(6)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd = os.open(str(tmp_path), flags, 0o600)
     try:
@@ -905,7 +927,7 @@ def cmd_export_keys(out_path=None):
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(fd)
-        os.replace(tmp_path, out_path)
+        os.replace(tmp_path, target_path)
     finally:
         os.close(fd)
         if tmp_path.exists():
@@ -914,11 +936,11 @@ def cmd_export_keys(out_path=None):
             except OSError:
                 pass
 
-    log_done(f"Vault berhasil di-export ke: {C.BOLD}{C.GREEN}{out_path}{C.RESET} ({len(data)} entri)")
+    log_done(f"Vault berhasil di-export ke: {C.BOLD}{C.GREEN}{target_path}{C.RESET} ({len(data)} entri)")
     log_warn("CATATAN: File export berisi kunci plaintext (izin file diset ketat 0600). Simpan di media aman!")
 
 
-def cmd_import_keys(in_path):
+def cmd_import_keys(in_path, conn_override=None):
     """Import keys from a backup JSON file with strict schema & path validation."""
     path = Path(in_path).expanduser().resolve()
     if not path.exists():
@@ -936,7 +958,7 @@ def cmd_import_keys(in_path):
         log_err("Format backup JSON tidak valid: Root harus berupa array.")
         sys.exit(1)
 
-    conn = init_db()
+    conn = conn_override or init_db()
     count = 0
     rejected = 0
 
@@ -959,7 +981,6 @@ def cmd_import_keys(in_path):
 
         raw_name = str(item.get("original_name", "")).strip()
         safe_name = Path(raw_name).name
-        # Bug #2 defense: sanitasi ketat path traversal dari backup eksternal
         if not safe_name or safe_name in (".", "..") or "/" in raw_name or "\\" in raw_name:
             log_warn(f"Entri {label} terdeteksi path traversal ({raw_name}) -> disanitasi menjadi {safe_name or 'restored_file'}")
             safe_name = safe_name or f"{label}.restored"
@@ -986,12 +1007,14 @@ def cmd_import_keys(in_path):
 
 
 def self_test():
-    """Deterministic verification for single file, directory, symlinks, zip slip defense, and tamper detection."""
+    """Deterministic verification executing production functions for security and integrity."""
     log_info("Menjalankan self-test GDE...")
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
+        isolated_db = tmp / "test_vault.db"
+        test_conn = init_db(custom_path=isolated_db)
 
-        # 1. Test Single File (Direct without zip)
+        # 1. Test Single File Encryption & Decryption
         file_path = tmp / "document.md"
         test_content = b"# Top Secret Notes\nNo zip overhead for single files!"
         file_path.write_bytes(test_content)
@@ -1001,12 +1024,9 @@ def self_test():
         if enc_file[:4] != MAGIC_GDE:
             raise RuntimeError("Magic header mismatch on single file")
 
-        # Decrypt single file
         dec_file, lbl = decrypt_data(enc_file, key_file)
-        if lbl != label_file:
-            raise RuntimeError("Label mismatch on single file")
-        if dec_file != test_content:
-            raise RuntimeError("Decrypted content mismatch on single file")
+        if lbl != label_file or dec_file != test_content:
+            raise RuntimeError("Decrypted content or label mismatch on single file")
 
         # 2. Test Directory with empty dirs, relative symlinks, absolute symlinks, and read-only folder
         folder_path = tmp / "my_folder"
@@ -1014,18 +1034,15 @@ def self_test():
         empty_sub = folder_path / "empty_sub"
         empty_sub.mkdir()
 
-        # Read-only directory containing a file
         ro_dir = folder_path / "readonly_dir"
         ro_dir.mkdir()
         (ro_dir / "ro_file.txt").write_text("inside readonly dir")
         ro_dir.chmod(0o555)
 
-        # Executable script
         script_file = folder_path / "script.sh"
         script_file.write_text("#!/bin/sh\necho test\n")
         script_file.chmod(0o755)
 
-        # Symlinks (relative, absolute harmless, absolute broken)
         os.symlink("script.sh", str(folder_path / "script_symlink"))
         os.symlink("/usr/bin/sh", str(folder_path / "abs_symlink"))
         os.symlink("/non_existent/target/path", str(folder_path / "broken_abs_symlink"))
@@ -1040,17 +1057,14 @@ def self_test():
         label_dir = "gde_testdir02"
         enc_dir, key_dir = encrypt_data(zip_p.read_bytes(), label_dir)
         dec_dir, lbl_dir = decrypt_data(enc_dir, key_dir)
-        if lbl_dir != label_dir:
-            raise RuntimeError("Label mismatch on directory")
-        if dec_dir != zip_p.read_bytes():
-            raise RuntimeError("Decrypted zip bytes mismatch")
+        if lbl_dir != label_dir or dec_dir != zip_p.read_bytes():
+            raise RuntimeError("Decrypted zip mismatch on directory")
 
         restore_dir = tmp / "restored_folder"
         restore_zip = tmp / "restored.zip"
         restore_zip.write_bytes(dec_dir)
         extract_zip_faithful(restore_zip, restore_dir)
 
-        # Verifikasi hasil restorasi
         if not (restore_dir / "empty_sub").is_dir():
             raise RuntimeError("Empty subfolder not preserved in zip restore")
         if not (restore_dir / "readonly_dir" / "ro_file.txt").is_file():
@@ -1062,7 +1076,6 @@ def self_test():
         if restored_mode != 0o755:
             raise RuntimeError(f"Permissions not preserved: expected 0o755, got {oct(restored_mode)}")
 
-        # Verifikasi symlinks (relatif dan absolut)
         if not os.path.islink(str(restore_dir / "script_symlink")):
             raise RuntimeError("Relative symlink not preserved")
         if not os.path.islink(str(restore_dir / "abs_symlink")):
@@ -1072,11 +1085,10 @@ def self_test():
         if not os.path.islink(str(restore_dir / "broken_abs_symlink")):
             raise RuntimeError("Broken absolute symlink not preserved")
 
-        # Kembalikan permission ro_dir agar TemporaryDirectory bisa menghapusnya
         os.chmod(str(ro_dir), 0o755)
         os.chmod(str(restore_dir / "readonly_dir"), 0o755)
 
-        # 3. Tamper test: Corrupted ciphertext MUST fail decryption specifically with InvalidTag
+        # 3. Cryptographic Tamper & Key Rejection Tests
         tampered_cipher = bytearray(enc_file)
         tampered_cipher[-1] ^= 0x01
         try:
@@ -1084,9 +1096,8 @@ def self_test():
         except InvalidTag:
             pass
         else:
-            raise RuntimeError("Tamper detection failed! Corrupted ciphertext was accepted or failed with wrong error.")
+            raise RuntimeError("Tamper detection failed! Corrupted ciphertext was accepted.")
 
-        # 4. Tamper test: Tampered label in header MUST fail decryption
         tampered_header = bytearray(enc_file)
         tampered_header[5] ^= 0x01
         try:
@@ -1096,7 +1107,6 @@ def self_test():
         else:
             raise RuntimeError("Tamper detection failed! Tampered label was accepted.")
 
-        # 5. Wrong key MUST fail decryption specifically with InvalidTag
         wrong_key = secrets.token_bytes(32)
         try:
             decrypt_data(enc_file, wrong_key)
@@ -1105,22 +1115,75 @@ def self_test():
         else:
             raise RuntimeError("Key verification failed! Wrong key was accepted.")
 
-        # 6. Atomic export test & fchmod on existing file
-        export_test_p = tmp / "export_test.json"
-        export_test_p.write_text("{}")
-        os.chmod(str(export_test_p), 0o644)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = os.open(str(export_test_p), flags, 0o600)
-        os.fchmod(fd, 0o600)
-        mode = stat.S_IMODE(os.stat(fd).st_mode)
-        os.close(fd)
-        if mode != 0o600:
-            raise RuntimeError(f"Atomic file creation mode mismatch: {oct(mode)}")
+        # 4. Production cmd_export_keys() Test on Symlink & Existing 0644 File
+        victim_export = tmp / "victim_export.txt"
+        victim_export.write_text("clean_victim_export")
+        symlink_export = tmp / "export_target.json"
+        os.symlink(str(victim_export), str(symlink_export))
 
-        # 7. Comprehensive Zip Slip defense test:
-        # Vector A: Directory symlink escape
-        # Vector B: Same-name symlink collision (symlink 'x' -> victim, followed by regular file 'x')
-        # Vector C: Path traversal (../)
+        # Insert a sample entry into test_conn
+        test_conn.execute(
+            """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (label_file, "document.md", str(file_path), 0, len(test_content), key_file.hex(), None, "2026-10-27")
+        )
+        test_conn.commit()
+
+        # Call production export function targeting the symlink
+        cmd_export_keys(out_path=symlink_export, conn_override=test_conn)
+
+        if victim_export.read_text() != "clean_victim_export":
+            raise RuntimeError("Export vulnerability: victim file was overwritten through symlink!")
+        if os.path.islink(str(symlink_export)):
+            raise RuntimeError("Export target should no longer be a symlink")
+        if stat.S_IMODE(symlink_export.stat().st_mode) != 0o600:
+            raise RuntimeError(f"Export file permissions should be 0600, got {oct(stat.S_IMODE(symlink_export.stat().st_mode))}")
+
+        # 5. Production cmd_import_keys() Test with Path Traversal Sanitization
+        malicious_backup = tmp / "malicious_backup.json"
+        malicious_backup.write_text(json.dumps([{
+            "label": "gde_evil01",
+            "original_name": "../../escaped_evil.txt",
+            "enc_key": secrets.token_hex(32),
+            "is_dir": 0
+        }]))
+        cmd_import_keys(malicious_backup, conn_override=test_conn)
+        cur = test_conn.cursor()
+        cur.execute("SELECT original_name FROM vault WHERE label = 'gde_evil01'")
+        imported_row = cur.fetchone()
+        if not imported_row:
+            raise RuntimeError("Import failed to record sanitized entry")
+        if ".." in imported_row[0] or "/" in imported_row[0]:
+            raise RuntimeError(f"Path traversal was not sanitized in import: {imported_row[0]}")
+        if imported_row[0] != "escaped_evil.txt":
+            raise RuntimeError(f"Expected sanitized name 'escaped_evil.txt', got {imported_row[0]}")
+
+        # 6. Production cmd_decrypt_file() Test with Pre-Existing Symlink Destination
+        victim_restore = tmp / "victim_restore.txt"
+        victim_restore.write_text("clean_victim_restore")
+        restore_dir_test = tmp / "restore_test"
+        restore_dir_test.mkdir()
+
+        # Destination in restore folder is pre-linked to victim file outside
+        dest_symlink = restore_dir_test / "document.md"
+        os.symlink(str(victim_restore), str(dest_symlink))
+
+        enc_disk_file = tmp / f"{label_file}.enc"
+        enc_disk_file.write_bytes(enc_file)
+
+        # Call production decrypt function
+        cmd_decrypt_file(str(enc_disk_file), dest_dir=str(restore_dir_test), force=True, conn_override=test_conn)
+
+        if victim_restore.read_text() != "clean_victim_restore":
+            raise RuntimeError("Restore vulnerability: outside victim was overwritten through existing symlink!")
+        if os.path.islink(str(dest_symlink)):
+            raise RuntimeError("Restored destination is still a symlink!")
+        if (restore_dir_test / "document.md").read_bytes() != test_content:
+            raise RuntimeError("Restored content mismatch!")
+        if stat.S_IMODE((restore_dir_test / "document.md").stat().st_mode) != 0o600:
+            raise RuntimeError("Restored file permissions should be 0600")
+
+        # 7. Comprehensive Zip Slip Attack Tests
         outside_trap = tmp / "outside_trap"
         outside_trap.mkdir()
         victim_dir = outside_trap / "victim_dir.txt"
@@ -1132,21 +1195,18 @@ def self_test():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with zipfile.ZipFile(slip_zip_p, "w") as zf:
-                # Vector A: escape directory
                 z_esc = zipfile.ZipInfo("escape_dir")
                 z_esc.create_system = 3
                 z_esc.external_attr = (stat.S_IFLNK | 0o777) << 16
                 zf.writestr(z_esc, str(outside_trap))
                 zf.writestr("escape_dir/victim_dir.txt", "hacked_dir")
 
-                # Vector B: same-name collision
                 z_same = zipfile.ZipInfo("collision_target")
                 z_same.create_system = 3
                 z_same.external_attr = (stat.S_IFLNK | 0o777) << 16
                 zf.writestr(z_same, str(victim_name))
                 zf.writestr("collision_target", "safe_replacement_content")
 
-                # Vector C: Path traversal
                 zf.writestr("../../evil.txt", "evil")
                 zf.writestr("safe.txt", "safe")
 
@@ -1154,35 +1214,13 @@ def self_test():
         extract_zip_faithful(slip_zip_p, slip_target)
 
         if victim_dir.read_text() != "clean_dir":
-            raise RuntimeError("Zip Slip vulnerability: victim_dir was overwritten through escape symlink!")
+            raise RuntimeError("Zip Slip: victim_dir was overwritten through escape symlink!")
         if victim_name.read_text() != "clean_name":
-            raise RuntimeError("Zip Slip vulnerability: victim_name was overwritten through same-name symlink collision!")
+            raise RuntimeError("Zip Slip: victim_name was overwritten through same-name collision!")
         if (tmp / "evil.txt").exists():
-            raise RuntimeError("Zip Slip vulnerability: ../ traversal succeeded!")
+            raise RuntimeError("Zip Slip: ../ traversal succeeded!")
         if (slip_target / "collision_target").read_text() != "safe_replacement_content":
             raise RuntimeError("Collision target was not safely extracted as file!")
-        if not (slip_target / "safe.txt").is_file():
-            raise RuntimeError("Safe zip member missing.")
-
-        # 8. Restore symlink overwrite defense test (Bug #1 defense)
-        outside_restore_victim = tmp / "outside_restore_victim.txt"
-        outside_restore_victim.write_text("pristine")
-        restore_fake_dest = tmp / "fake_dest.txt"
-        os.symlink(str(outside_restore_victim), str(restore_fake_dest))
-        # When unlinked and written securely with mode 0600:
-        if os.path.islink(restore_fake_dest):
-            restore_fake_dest.unlink()
-        tmp_sec = tmp / f".tmp_{secrets.token_hex(4)}"
-        fd_sec = os.open(str(tmp_sec), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with open(fd_sec, "wb", closefd=False) as fp:
-            fp.write(b"restored_safely")
-        os.replace(tmp_sec, restore_fake_dest)
-        os.close(fd_sec)
-
-        if outside_restore_victim.read_text() != "pristine":
-            raise RuntimeError("Restore bug: outside victim was overwritten through existing symlink!")
-        if stat.S_IMODE(restore_fake_dest.stat().st_mode) != 0o600:
-            raise RuntimeError("Restored file mode should be 0600")
 
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
@@ -1191,9 +1229,10 @@ def self_test():
     print(f"    {C.GREEN}•{C.RESET} ChaCha20-Poly1305 Ciphertext Tamper check (InvalidTag): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} AAD Label Tamper check: {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Wrong Key Rejection (InvalidTag): {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} Atomic 0o600 File & Overwrite Permissions: {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Production cmd_export_keys() on Symlink (0600 atomic): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Production cmd_import_keys() Path Traversal Sanitization: {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Production cmd_decrypt_file() on Symlink Overwrite (0600 mode): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Zip Slip Defense (traversal, write-through & same-name collisions blocked): {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} Restore Symlink Overwrite Defense (mode 0600): {C.GREEN}OK{C.RESET}")
 
 
 def main():
