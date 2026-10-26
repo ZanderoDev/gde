@@ -14,7 +14,7 @@ import secrets
 import shutil
 import tempfile
 import subprocess
-import select
+import queue
 import threading
 import stat
 from pathlib import Path
@@ -102,7 +102,17 @@ class GDriveMCP:
         self.proc = None
         self.timeout = timeout
         self.stderr_buf = []
-        self._stderr_thread = None
+        self._stdout_queue = queue.Queue()
+        self._threads = []
+
+    def _drain_stdout(self):
+        try:
+            for line in iter(self.proc.stdout.readline, ""):
+                if not line:
+                    break
+                self._stdout_queue.put(line)
+        except Exception:
+            pass
 
     def _drain_stderr(self):
         try:
@@ -125,9 +135,12 @@ class GDriveMCP:
                 text=True,
                 bufsize=1
             )
-            # Drain stderr asynchronously to prevent pipe deadlocks
-            self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
-            self._stderr_thread.start()
+            # Background reader threads prevent buffer deadlocks & select/readline mismatch
+            t_out = threading.Thread(target=self._drain_stdout, daemon=True)
+            t_err = threading.Thread(target=self._drain_stderr, daemon=True)
+            t_out.start()
+            t_err.start()
+            self._threads = [t_out, t_err]
 
             init_res = self._send({
                 "jsonrpc": "2.0",
@@ -136,7 +149,7 @@ class GDriveMCP:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "gde-cli", "version": "1.2.0"}
+                    "clientInfo": {"name": "gde-cli", "version": "1.3.0"}
                 }
             })
             if "error" in init_res:
@@ -157,17 +170,13 @@ class GDriveMCP:
             if remaining <= 0:
                 raise TimeoutError(f"Timeout menunggu response MCP server ({self.timeout} detik).")
 
-            r, _, _ = select.select([self.proc.stdout], [], [], min(remaining, 1.0))
-            if not r:
+            try:
+                line = self._stdout_queue.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
                 if self.proc.poll() is not None:
                     err = "".join(self.stderr_buf)
                     raise RuntimeError(f"MCP server berhenti mendadak (exit code {self.proc.returncode}): {err}")
                 continue
-
-            line = self.proc.stdout.readline()
-            if not line:
-                err = "".join(self.stderr_buf)
-                raise RuntimeError(f"MCP server menutup koneksi: {err}")
 
             line = line.strip()
             if not line:
@@ -176,7 +185,7 @@ class GDriveMCP:
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
-                # Lewati output non-JSON (seperti log internal server)
+                # Lewati baris log non-JSON dari server stdout
                 continue
 
             if req_id is not None and data.get("id") != req_id:
@@ -239,8 +248,11 @@ class GDriveMCP:
 
 
 def compress_directory(src_dir, out_zip):
-    """Compress directory preserving empty folders, symlinks, and file permissions."""
+    """Compress directory preserving empty folders, symlinks, and file permissions. Safely skips FIFOs."""
     src = Path(src_dir).resolve()
+    unreadable = []
+    special_files = []
+
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(src, followlinks=False):
             root_p = Path(root)
@@ -257,51 +269,87 @@ def compress_directory(src_dir, out_zip):
                 else:
                     zinfo = zipfile.ZipInfo(f"{rel_p}/")
                     zinfo.create_system = 3  # Unix
-                    mode = dir_p.stat().st_mode
-                    zinfo.external_attr = (mode & 0xFFFF) << 16
+                    try:
+                        mode = dir_p.stat().st_mode
+                        zinfo.external_attr = (mode & 0xFFFF) << 16
+                    except OSError:
+                        zinfo.external_attr = (stat.S_IFDIR | 0o755) << 16
                     zf.writestr(zinfo, b"")
 
             for f in files:
                 full_p = root_p / f
                 rel_p = full_p.relative_to(src).as_posix()
-                if os.path.islink(full_p):
+
+                try:
+                    st = os.lstat(full_p)
+                except OSError as e:
+                    unreadable.append((str(full_p), str(e)))
+                    continue
+
+                if stat.S_ISLNK(st.st_mode):
                     link_target = os.readlink(full_p)
                     zinfo = zipfile.ZipInfo(rel_p)
                     zinfo.create_system = 3  # Unix
                     zinfo.external_attr = (stat.S_IFLNK | 0o777) << 16
                     zf.writestr(zinfo, link_target)
-                else:
+                elif stat.S_ISREG(st.st_mode):
                     try:
-                        mode = full_p.stat().st_mode
                         with open(full_p, "rb") as fp:
                             data = fp.read()
-                    except (FileNotFoundError, OSError):
+                    except OSError as e:
+                        unreadable.append((str(full_p), str(e)))
                         continue
                     zinfo = zipfile.ZipInfo(rel_p)
                     zinfo.create_system = 3  # Unix
-                    zinfo.external_attr = (mode & 0xFFFF) << 16
+                    zinfo.external_attr = (st.st_mode & 0xFFFF) << 16
                     zinfo.compress_type = zipfile.ZIP_DEFLATED
                     zf.writestr(zinfo, data)
+                else:
+                    # Skip special files (FIFO, socket, block/char dev) to prevent hanging
+                    special_files.append(str(full_p))
+
+    if special_files:
+        log_warn(f"{len(special_files)} file khusus (FIFO/socket/device) dilewati untuk mencegah hang.")
+    if unreadable:
+        log_warn(f"{len(unreadable)} file tidak dapat dibaca karena masalah izin/akses:")
+        for upath, uerr in unreadable[:5]:
+            print(f"    {C.GRAY}• {upath}: {uerr}{C.RESET}")
+        if len(unreadable) > 5:
+            print(f"    {C.GRAY}...dan {len(unreadable) - 5} file lainnya.{C.RESET}")
 
 
 def extract_zip_faithful(zip_path, dest_dir):
-    """Extract zip preserving directory hierarchy, symlinks, and POSIX permissions."""
+    """Extract zip with Zip Slip protection, preserving directory hierarchy, symlinks, and POSIX permissions."""
     dest = Path(dest_dir).resolve()
     dest.mkdir(parents=True, exist_ok=True)
     dir_perms = []
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         for member in zf.infolist():
+            # Zip Slip defense: pastikan target path selalu di dalam dest
+            target_path = (dest / member.filename).resolve()
+            try:
+                target_path.relative_to(dest)
+            except ValueError:
+                log_warn(f"Entri arsip berbahaya ditolak (Zip Slip attempt): {member.filename}")
+                continue
+
             perm = (member.external_attr >> 16) & 0xFFFF
             is_symlink = stat.S_ISLNK(perm)
             is_dir = member.filename.endswith("/")
-            target_path = dest / member.filename
 
             if is_symlink:
                 link_target = zf.read(member).decode("utf-8")
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 if target_path.exists() or os.path.islink(target_path):
                     target_path.unlink()
+                # Tolak symlink absolut yang mengarah ke luar folder dest
+                if os.path.isabs(link_target):
+                    try:
+                        Path(link_target).resolve().relative_to(dest)
+                    except ValueError:
+                        log_warn(f"Symlink absolut keluar batas ditolak: {member.filename} -> {link_target}")
+                        continue
                 try:
                     os.symlink(link_target, target_path)
                 except OSError:
@@ -310,6 +358,7 @@ def extract_zip_faithful(zip_path, dest_dir):
                 target_path.mkdir(parents=True, exist_ok=True)
                 dir_perms.append((target_path, perm & 0o777))
             else:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
                 extracted = Path(zf.extract(member, dest))
                 file_perm = perm & 0o777
                 if file_perm:
@@ -318,7 +367,7 @@ def extract_zip_faithful(zip_path, dest_dir):
                     except Exception:
                         pass
 
-    # Terapkan izin direktori setelah semua file diekstrak (urut dari path terdalam)
+    # Terapkan izin direktori setelah seluruh isi selesai diekstrak (dari path terdalam)
     dir_perms.sort(key=lambda x: len(x[0].parts), reverse=True)
     for dpath, dperm in dir_perms:
         if dperm:
@@ -521,7 +570,12 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False):
         log_info(f"Kunci ditemukan di vault untuk file: {C.BOLD}{name}{C.RESET}")
     else:
         log_warn("Kunci untuk label ini tidak ditemukan di database vault lokal.")
-        key_input = input(f"{C.CYAN}Masukkan 64-karakter hex key (atau 'q' keluar): {C.RESET}").strip()
+        try:
+            key_input = input(f"{C.CYAN}Masukkan 64-karakter hex key (atau 'q' keluar): {C.RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nDibatalkan atau stream input ditutup.")
+            sys.exit(1)
+
         if not key_input or key_input.lower() == "q":
             sys.exit(1)
         try:
@@ -696,7 +750,7 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False):
 
 
 def cmd_export_keys(out_path=None):
-    """Export vault database to a backup JSON file with atomic 0o600 permissions."""
+    """Export vault database to a backup JSON file with strict 0o600 permissions."""
     conn = init_db()
     cur = conn.cursor()
     cur.execute("SELECT id, label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at FROM vault")
@@ -721,11 +775,14 @@ def cmd_export_keys(out_path=None):
     else:
         out_path = Path(out_path).resolve()
 
-    # Buat file secara atomik dengan izin 0o600 (menghindari race window)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     fd = os.open(str(out_path), flags, 0o600)
-    with open(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    try:
+        os.fchmod(fd, 0o600)  # Pastikan file lama yang ditimpa juga terkunci 0600
+        with open(fd, "w", encoding="utf-8", closefd=False) as f:
+            json.dump(data, f, indent=2)
+    finally:
+        os.close(fd)
 
     log_done(f"Vault berhasil di-export ke: {C.BOLD}{C.GREEN}{out_path}{C.RESET} ({len(data)} entri)")
     log_warn("CATATAN: File export berisi kunci plaintext (izin file diset ketat 0600). Simpan di media aman!")
@@ -844,7 +901,7 @@ def self_test():
         os.chmod(str(ro_dir), 0o755)
         os.chmod(str(restore_dir / "readonly_dir"), 0o755)
 
-        # 3. Tamper test: Corrupted ciphertext MUST fail decryption with InvalidTag
+        # 3. Tamper test: Corrupted ciphertext MUST fail decryption specifically with InvalidTag
         tampered_cipher = bytearray(enc_file)
         tampered_cipher[-1] ^= 0x01
         try:
@@ -852,7 +909,7 @@ def self_test():
         except InvalidTag:
             pass
         else:
-            raise RuntimeError("Tamper detection failed! Corrupted ciphertext was accepted.")
+            raise RuntimeError("Tamper detection failed! Corrupted ciphertext was accepted or failed with wrong error.")
 
         # 4. Tamper test: Tampered label in header MUST fail decryption
         tampered_header = bytearray(enc_file)
@@ -864,7 +921,7 @@ def self_test():
         else:
             raise RuntimeError("Tamper detection failed! Tampered label was accepted.")
 
-        # 5. Wrong key MUST fail decryption with InvalidTag
+        # 5. Wrong key MUST fail decryption specifically with InvalidTag
         wrong_key = secrets.token_bytes(32)
         try:
             decrypt_data(enc_file, wrong_key)
@@ -873,22 +930,38 @@ def self_test():
         else:
             raise RuntimeError("Key verification failed! Wrong key was accepted.")
 
-        # 6. Atomic export test
+        # 6. Atomic export test & fchmod on existing file
         export_test_p = tmp / "export_test.json"
+        export_test_p.write_text("{}")
+        os.chmod(str(export_test_p), 0o644)
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         fd = os.open(str(export_test_p), flags, 0o600)
+        os.fchmod(fd, 0o600)
         mode = stat.S_IMODE(os.stat(fd).st_mode)
         os.close(fd)
         if mode != 0o600:
             raise RuntimeError(f"Atomic file creation mode mismatch: {oct(mode)}")
+
+        # 7. Zip Slip attempt rejection test
+        slip_zip_p = tmp / "slip.zip"
+        with zipfile.ZipFile(slip_zip_p, "w") as zf:
+            zf.writestr("../../evil.txt", "evil")
+            zf.writestr("safe.txt", "safe")
+        slip_target = tmp / "slip_target"
+        extract_zip_faithful(slip_zip_p, slip_target)
+        if (tmp / "evil.txt").exists():
+            raise RuntimeError("Zip Slip vulnerability detected! Path traversal succeeded.")
+        if not (slip_target / "safe.txt").is_file():
+            raise RuntimeError("Safe zip member not extracted.")
 
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Folder (empty dirs, symlinks, 0555 readonly & 0755 exec): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} ChaCha20-Poly1305 Ciphertext Tamper check (InvalidTag): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} AAD Label Tamper check: {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} Wrong Key Rejection: {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} Atomic 0o600 File Creation: {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Wrong Key Rejection (InvalidTag): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Atomic 0o600 File & Overwrite Permissions: {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Zip Slip Defense (Path Traversal Rejection): {C.GREEN}OK{C.RESET}")
 
 
 def main():
