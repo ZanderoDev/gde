@@ -75,8 +75,8 @@ def init_db(custom_path=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
+    except OSError as e:
+        log_warn(f"Tidak dapat menerapkan mode 0700 pada direktori vault '{path.parent}': {e}")
 
     # Migrate from legacy egd path if needed
     if not custom_path and not DB_PATH.exists() and LEGACY_DB.exists():
@@ -99,8 +99,8 @@ def init_db(custom_path=None):
     conn.commit()
     try:
         os.chmod(path, 0o600)
-    except OSError:
-        pass
+    except OSError as e:
+        log_warn(f"Tidak dapat menerapkan mode 0600 pada database vault '{path}': {e}")
     return conn
 
 
@@ -111,6 +111,26 @@ def is_subpath(child, parent):
         return True
     except ValueError:
         return False
+
+
+def atomic_copy_file(src_path, dest_path, mode=0o600):
+    """Copy a file to dest_path atomically without overwriting existing hard links."""
+    dest = Path(dest_path).resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest.parent / f".tmp_cp_{secrets.token_hex(6)}"
+
+    with open(src_path, "rb") as s, open(tmp_path, "wb") as d:
+        d.write(s.read())
+        d.flush()
+        os.fsync(d.fileno())
+
+    try:
+        os.chmod(tmp_path, mode)
+    except OSError:
+        pass
+
+    # os.replace unlinks the old directory entry and links the new inode, breaking any hard links safely
+    os.replace(tmp_path, dest)
 
 
 class GDriveMCP:
@@ -166,7 +186,7 @@ class GDriveMCP:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "gde-cli", "version": "1.4.1"}
+                    "clientInfo": {"name": "gde-cli", "version": "1.4.2"}
                 }
             })
             if "error" in init_res:
@@ -329,7 +349,7 @@ def compress_directory(src_dir, out_zip):
 
 
 def extract_zip_faithful(zip_path, dest_dir):
-    """Extract zip with Zip Slip protection, symlink collision mitigation, and POSIX permissions."""
+    """Extract zip with Zip Slip protection, hard link collision defense, and POSIX permissions."""
     dest = Path(dest_dir).resolve()
     dest.mkdir(parents=True, exist_ok=True)
     dir_perms = []
@@ -378,11 +398,29 @@ def extract_zip_faithful(zip_path, dest_dir):
                     continue
 
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                extracted = Path(zf.extract(member, dest))
-                file_perm = perm & 0o777
+                file_data = zf.read(member)
+
+                # Hard link defense: ekstrak ke file sementara baru, lalu ganti secara atomik dengan os.replace
+                tmp_out = target_path.parent / f".tmp_ext_{secrets.token_hex(6)}"
+                file_perm = (perm & 0o777) or 0o600
+                fd = os.open(str(tmp_out), os.O_WRONLY | os.O_CREAT | os.O_EXCL, file_perm)
+                try:
+                    with open(fd, "wb", closefd=False) as fp:
+                        fp.write(file_data)
+                        fp.flush()
+                        os.fsync(fd)
+                    os.replace(tmp_out, target_path)
+                finally:
+                    os.close(fd)
+                    if tmp_out.exists():
+                        try:
+                            tmp_out.unlink()
+                        except OSError:
+                            pass
+
                 if file_perm:
                     try:
-                        os.chmod(extracted, file_perm)
+                        os.chmod(target_path, file_perm)
                     except Exception:
                         pass
 
@@ -536,9 +574,8 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
             conn.commit()
 
             try:
-                if os.path.islink(out_enc):
-                    out_enc.unlink()
-                shutil.copy2(temp_enc, out_enc)
+                # Bug #1: Salin secara atomik agar tidak menimpa inode hardlink yang ada
+                atomic_copy_file(temp_enc, out_enc, mode=0o644)
             except Exception as e:
                 conn.execute("DELETE FROM vault WHERE label = ?", (label,))
                 conn.commit()
@@ -588,9 +625,7 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
             if fallback_enc.exists() and not force:
                 fallback_enc = Path.cwd() / f"{target.name}.{secrets.token_hex(4)}.enc"
 
-            if os.path.islink(fallback_enc):
-                fallback_enc.unlink()
-            shutil.copy2(temp_enc, fallback_enc)
+            atomic_copy_file(temp_enc, fallback_enc, mode=0o644)
             log_err(f"GDrive MCP Error: {upload_err}")
             log_warn(f"Upload gagal. File terenkripsi diamankan ke: {C.BOLD}{fallback_enc}{C.RESET}")
             log_info(f"Kunci sudah tersimpan di vault. Untuk restore: {C.GREEN}gde decrypt {fallback_enc.name}{C.RESET}")
@@ -681,7 +716,7 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
     base_dest_dir = Path(dest_dir).resolve()
     dest = base_dest_dir / safe_name
 
-    # Validasi bahwa target berada di dalam base_dest_dir tanpa melompat lewat directory parent traversal
+    # Validasi bahwa parent target berada di dalam base_dest_dir
     if not is_subpath(dest.parent, base_dest_dir):
         log_err(f"Path traversal terdeteksi pada target pemulihan: {dest}")
         sys.exit(1)
@@ -690,7 +725,7 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
         log_warn("Dibatalkan oleh pengguna.")
         sys.exit(1)
 
-    # Hapus symlink yang sudah ada pada lokasi tujuan sebelum menulis
+    # Hapus symlink lama pada lokasi tujuan sebelum menulis
     if os.path.islink(dest):
         log_warn(f"Target '{dest.name}' adalah symlink yang sudah ada. Menghapus symlink sebelum memulihkan...")
         dest.unlink()
@@ -703,7 +738,7 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
             log_info(f"Mengekstrak folder ke: {C.BOLD}{dest}{C.RESET}")
             extract_zip_faithful(tmp_zip, dest)
     else:
-        # Tulis secara atomik dengan izin ketat 0600
+        # Tulis secara atomik dengan izin ketat 0600 (memutus hardlink lama secara aman)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = dest.parent / f".tmp_{secrets.token_hex(6)}"
         fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -864,6 +899,7 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None
             decrypted_zip.write_bytes(dec_bytes)
             extract_zip_faithful(decrypted_zip, dest)
         else:
+            # Tulis secara atomik dengan izin ketat 0600 (memutus hardlink lama dengan aman)
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp_file = dest.parent / f".tmp_{secrets.token_hex(6)}"
             fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1121,7 +1157,6 @@ def self_test():
         symlink_export = tmp / "export_target.json"
         os.symlink(str(victim_export), str(symlink_export))
 
-        # Insert a sample entry into test_conn
         test_conn.execute(
             """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1129,7 +1164,6 @@ def self_test():
         )
         test_conn.commit()
 
-        # Call production export function targeting the symlink
         cmd_export_keys(out_path=symlink_export, conn_override=test_conn)
 
         if victim_export.read_text() != "clean_victim_export":
@@ -1164,14 +1198,12 @@ def self_test():
         restore_dir_test = tmp / "restore_test"
         restore_dir_test.mkdir()
 
-        # Destination in restore folder is pre-linked to victim file outside
         dest_symlink = restore_dir_test / "document.md"
         os.symlink(str(victim_restore), str(dest_symlink))
 
         enc_disk_file = tmp / f"{label_file}.enc"
         enc_disk_file.write_bytes(enc_file)
 
-        # Call production decrypt function
         cmd_decrypt_file(str(enc_disk_file), dest_dir=str(restore_dir_test), force=True, conn_override=test_conn)
 
         if victim_restore.read_text() != "clean_victim_restore":
@@ -1222,6 +1254,44 @@ def self_test():
         if (slip_target / "collision_target").read_text() != "safe_replacement_content":
             raise RuntimeError("Collision target was not safely extracted as file!")
 
+        # 8. Hard Link Defense in Local Encrypt
+        victim_hl = tmp / "victim_hl.txt"
+        victim_hl.write_text("VICTIM_HARDLINK_CONTENT")
+        target_hl = tmp / "target_hl.enc"
+        os.link(str(victim_hl), str(target_hl))
+
+        sample_ciphertext = tmp / "sample.enc"
+        sample_ciphertext.write_bytes(b"CIPHERTEXT_SAMPLE")
+        atomic_copy_file(sample_ciphertext, target_hl)
+
+        if victim_hl.read_text() != "VICTIM_HARDLINK_CONTENT":
+            raise RuntimeError("Hard link vulnerability: victim_hl was overwritten during atomic file copy!")
+        if target_hl.read_bytes() != b"CIPHERTEXT_SAMPLE":
+            raise RuntimeError("target_hl content mismatch!")
+        if os.stat(victim_hl).st_ino == os.stat(target_hl).st_ino:
+            raise RuntimeError("Hard link was not broken during atomic replace!")
+
+        # 9. Hard Link Defense in ZIP Restore
+        outside_victim_zip_hl = tmp / "outside_victim_zip_hl.txt"
+        outside_victim_zip_hl.write_text("OUTSIDE_ZIP_HL_ORIGINAL")
+        restore_hl_dir = tmp / "restore_hl"
+        restore_hl_dir.mkdir()
+        existing_safe_hl = restore_hl_dir / "safe_hl.txt"
+        os.link(str(outside_victim_zip_hl), str(existing_safe_hl))
+
+        zip_hl_p = tmp / "test_hl.zip"
+        with zipfile.ZipFile(zip_hl_p, "w") as zf:
+            zf.writestr("safe_hl.txt", "NEW_EXTRACTED_DATA")
+
+        extract_zip_faithful(zip_hl_p, restore_hl_dir)
+
+        if outside_victim_zip_hl.read_text() != "OUTSIDE_ZIP_HL_ORIGINAL":
+            raise RuntimeError("Hard link vulnerability: outside_victim_zip_hl was overwritten during zip extraction!")
+        if existing_safe_hl.read_text() != "NEW_EXTRACTED_DATA":
+            raise RuntimeError("extracted safe_hl.txt content mismatch!")
+        if os.stat(outside_victim_zip_hl).st_ino == os.stat(existing_safe_hl).st_ino:
+            raise RuntimeError("Hard link was not broken during zip extraction replace!")
+
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Folder (empty dirs, 0555 readonly & 0755 exec): {C.GREEN}OK{C.RESET}")
@@ -1233,6 +1303,8 @@ def self_test():
     print(f"    {C.GREEN}•{C.RESET} Production cmd_import_keys() Path Traversal Sanitization: {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Production cmd_decrypt_file() on Symlink Overwrite (0600 mode): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Zip Slip Defense (traversal, write-through & same-name collisions blocked): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Hard Link Defense in Local Encrypt (atomic inode severance): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Hard Link Defense in ZIP Restore (victim preservation): {C.GREEN}OK{C.RESET}")
 
 
 def main():
