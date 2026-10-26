@@ -214,11 +214,20 @@ gde import-keys cadangan-kunci.json
 ```
 > **Catatan:** File export berisi kunci plaintext. Pastikan disimpan di media penyimpanan yang aman (misalnya drive terenkripsi/LUKS).
 
-### Opsi Timpa File (--force)
-Secara default, GDE akan meminta konfirmasi `[y/N]` sebelum menimpa file yang sudah ada. Pada lingkungan non-interaktif (script/cron), tambahkan flag `--force` atau `-f`:
+### Opsi Tambahan
+
+#### 1. Penimpaan File Otomatis (`--force` / `-f`)
+Secara default, GDE meminta konfirmasi `[y/N]` sebelum menimpa file atau folder yang sudah ada di disk. Untuk eksekusi otomatis tanpa prompt (misal di script atau cron), sertakan flag `--force` atau `-f`:
 ```bash
 gde download 1 --force
 gde decrypt dokumen.md.enc -f
+```
+
+#### 2. Abaikan Berkas Tak Terbaca (`--allow-partial`)
+Jika sebuah folder berisi file atau subdirektori yang tidak bisa dibaca (misalnya izin `000` atau milik root), GDE akan menampilkan daftar file tersebut dan berhenti dengan **exit code 2** (agar script/cron tahu backup tidak 100% lengkap).
+Untuk tetap memproses dan mengabaikan entri yang tak terbaca (exit code 0):
+```bash
+gde ~/Proyek --allow-partial
 ```
 
 ### Jalankan Self-Test

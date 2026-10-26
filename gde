@@ -17,6 +17,7 @@ import subprocess
 import queue
 import threading
 import stat
+import warnings
 from pathlib import Path
 from datetime import datetime
 
@@ -96,7 +97,7 @@ def init_db():
 
 
 def is_subpath(child, parent):
-    """Check if child path resolves within parent path."""
+    """Check if child path resolves safely within parent path."""
     try:
         Path(child).resolve().relative_to(Path(parent).resolve())
         return True
@@ -157,7 +158,7 @@ class GDriveMCP:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "gde-cli", "version": "1.3.1"}
+                    "clientInfo": {"name": "gde-cli", "version": "1.3.2"}
                 }
             })
             if "error" in init_res:
@@ -359,8 +360,13 @@ def extract_zip_faithful(zip_path, dest_dir):
                 target_path.mkdir(parents=True, exist_ok=True)
                 dir_perms.append((target_path, perm & 0o777))
             else:
-                # File biasa: parent path harus resolve di dalam dest (mencegah penulisan via symlink!)
-                if not is_subpath(target_path.parent, dest):
+                # File biasa:
+                # Hapus symlink yang sudah ada pada target_path jika entri sebelumnya adalah symlink
+                if os.path.islink(target_path):
+                    target_path.unlink()
+
+                # Pastikan target_path dan parent-nya tidak tembus ke luar folder tujuan
+                if not is_subpath(target_path.parent, dest) or not is_subpath(target_path, dest):
                     log_warn(f"Penulisan file melewati symlink ditolak: {member.filename}")
                     continue
 
@@ -440,7 +446,7 @@ def confirm_overwrite(dest_path, force=False):
     return ans in ("y", "yes")
 
 
-def cmd_encrypt(path_str, local_only=False, force=False):
+def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
     target = Path(path_str).expanduser().resolve()
     if not target.exists() and not os.path.islink(target):
         log_err(f"Path '{target}' tidak ditemukan.")
@@ -509,10 +515,14 @@ def cmd_encrypt(path_str, local_only=False, force=False):
             log_success(f"Kunci tersimpan di vault lokal: {C.DIM}{DB_PATH}{C.RESET}")
             log_info(f"Untuk restore lokal: {C.GREEN}gde decrypt {out_enc.name}{C.RESET}")
 
-            if unreadable_items and not force:
+            if unreadable_items and not allow_partial:
                 log_warn(f"Selesai DENGAN PERINGATAN: Backup parsial ({len(unreadable_items)} entri dilewati).")
+                log_info(f"Gunakan flag {C.YELLOW}--allow-partial{C.RESET} jika sengaja ingin mengabaikan entri tak terbaca.")
                 sys.exit(2)
-            log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi lokal.")
+            elif unreadable_items:
+                log_warn(f"Selesai: Backup parsial ({len(unreadable_items)} entri dilewati, --allow-partial aktif).")
+            else:
+                log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi lokal.")
             return
 
         # Mode online: upload via Google Drive MCP
@@ -554,10 +564,14 @@ def cmd_encrypt(path_str, local_only=False, force=False):
         conn.commit()
         log_success(f"Kunci & metadata aman tersimpan di {C.DIM}{DB_PATH}{C.RESET}")
 
-        if unreadable_items and not force:
+        if unreadable_items and not allow_partial:
             log_warn(f"Selesai DENGAN PERINGATAN: Backup cloud parsial ({len(unreadable_items)} entri dilewati).")
+            log_info(f"Gunakan flag {C.YELLOW}--allow-partial{C.RESET} jika sengaja ingin mengabaikan entri tak terbaca.")
             sys.exit(2)
-        log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi penuh di cloud.")
+        elif unreadable_items:
+            log_warn(f"Selesai: Backup cloud parsial ({len(unreadable_items)} entri dilewati, --allow-partial aktif).")
+        else:
+            log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi penuh di cloud.")
 
 
 def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False):
@@ -845,7 +859,7 @@ def cmd_import_keys(in_path):
 
 
 def self_test():
-    """Deterministic verification for single file, directory, symlinks, and tamper detection."""
+    """Deterministic verification for single file, directory, symlinks, zip slip defense, and tamper detection."""
     log_info("Menjalankan self-test GDE...")
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -976,29 +990,52 @@ def self_test():
         if mode != 0o600:
             raise RuntimeError(f"Atomic file creation mode mismatch: {oct(mode)}")
 
-        # 7. Zip Slip attempt rejection test (writing through escape symlink)
+        # 7. Comprehensive Zip Slip defense test:
+        # Vector A: Directory symlink escape
+        # Vector B: Same-name symlink collision (symlink 'x' -> victim, followed by regular file 'x')
+        # Vector C: Path traversal (../)
         outside_trap = tmp / "outside_trap"
         outside_trap.mkdir()
-        (outside_trap / "victim.txt").write_text("clean")
+        victim_dir = outside_trap / "victim_dir.txt"
+        victim_name = outside_trap / "victim_same_name.txt"
+        victim_dir.write_text("clean_dir")
+        victim_name.write_text("clean_name")
 
-        slip_zip_p = tmp / "slip.zip"
-        with zipfile.ZipFile(slip_zip_p, "w") as zf:
-            z_esc = zipfile.ZipInfo("escape_link")
-            z_esc.create_system = 3
-            z_esc.external_attr = (stat.S_IFLNK | 0o777) << 16
-            zf.writestr(z_esc, str(outside_trap))
-            zf.writestr("escape_link/victim.txt", "hacked")
-            zf.writestr("../../evil.txt", "evil")
-            zf.writestr("safe.txt", "safe")
+        slip_zip_p = tmp / "slip_comprehensive.zip"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with zipfile.ZipFile(slip_zip_p, "w") as zf:
+                # Vector A: escape directory
+                z_esc = zipfile.ZipInfo("escape_dir")
+                z_esc.create_system = 3
+                z_esc.external_attr = (stat.S_IFLNK | 0o777) << 16
+                zf.writestr(z_esc, str(outside_trap))
+                zf.writestr("escape_dir/victim_dir.txt", "hacked_dir")
+
+                # Vector B: same-name collision
+                z_same = zipfile.ZipInfo("collision_target")
+                z_same.create_system = 3
+                z_same.external_attr = (stat.S_IFLNK | 0o777) << 16
+                zf.writestr(z_same, str(victim_name))
+                zf.writestr("collision_target", "safe_replacement_content")
+
+                # Vector C: Path traversal
+                zf.writestr("../../evil.txt", "evil")
+                zf.writestr("safe.txt", "safe")
 
         slip_target = tmp / "slip_target"
         extract_zip_faithful(slip_zip_p, slip_target)
-        if (outside_trap / "victim.txt").read_text() != "clean":
-            raise RuntimeError("Zip Slip vulnerability: Victim outside dest was overwritten through symlink!")
+
+        if victim_dir.read_text() != "clean_dir":
+            raise RuntimeError("Zip Slip vulnerability: victim_dir was overwritten through escape symlink!")
+        if victim_name.read_text() != "clean_name":
+            raise RuntimeError("Zip Slip vulnerability: victim_name was overwritten through same-name symlink collision!")
         if (tmp / "evil.txt").exists():
-            raise RuntimeError("Zip Slip vulnerability detected! Path traversal succeeded.")
+            raise RuntimeError("Zip Slip vulnerability: ../ traversal succeeded!")
+        if (slip_target / "collision_target").read_text() != "safe_replacement_content":
+            raise RuntimeError("Collision target was not safely extracted as file!")
         if not (slip_target / "safe.txt").is_file():
-            raise RuntimeError("Safe zip member not extracted.")
+            raise RuntimeError("Safe zip member missing.")
 
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
@@ -1008,18 +1045,24 @@ def self_test():
     print(f"    {C.GREEN}•{C.RESET} AAD Label Tamper check: {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Wrong Key Rejection (InvalidTag): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Atomic 0o600 File & Overwrite Permissions: {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} Zip Slip Defense (write-through-symlink & traversal blocked): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Zip Slip Defense (traversal, write-through & same-name collisions blocked): {C.GREEN}OK{C.RESET}")
 
 
 def main():
     args = sys.argv[1:]
     force = False
+    allow_partial = False
+
     if "--force" in args:
         force = True
         args.remove("--force")
     if "-f" in args:
         force = True
         args.remove("-f")
+
+    if "--allow-partial" in args:
+        allow_partial = True
+        args.remove("--allow-partial")
 
     if not args or args[0] in ("-h", "--help"):
         print(f"\n{C.BOLD}{C.CYAN}  ╔═════════════════════════════════════════════════════════════╗{C.RESET}")
@@ -1034,7 +1077,9 @@ def main():
         print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}  Export cadangan kunci vault ke file JSON (chmod 600)")
         print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}  Import kunci vault dari file JSON")
         print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                Jalankan internal verification self-test")
-        print(f"  {C.GRAY}Opsi global: --force / -f (lewati konfirmasi penimpaan file & abaikan unreadable){C.RESET}\n")
+        print(f"  {C.GRAY}Opsi tambahan:{C.RESET}")
+        print(f"    {C.YELLOW}--force / -f{C.RESET}          Lewati konfirmasi penimpaan file saat restore/dekripsi")
+        print(f"    {C.YELLOW}--allow-partial{C.RESET}       Abaikan error file/direktori tak terbaca (exit code 0 alih-alih 2)\n")
         sys.exit(0)
 
     cmd = args[0]
@@ -1064,9 +1109,9 @@ def main():
         if len(args) < 2:
             log_err("Berikan path file/folder.")
             sys.exit(1)
-        cmd_encrypt(args[1], local_only=True, force=force)
+        cmd_encrypt(args[1], local_only=True, force=force, allow_partial=allow_partial)
     else:
-        cmd_encrypt(cmd, local_only=False, force=force)
+        cmd_encrypt(cmd, local_only=False, force=force, allow_partial=allow_partial)
 
 
 if __name__ == "__main__":
