@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/python-3.8%2B-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/cipher-ChaCha20--Poly1305-emerald.svg" alt="Cipher">
   <img src="https://img.shields.io/badge/protocol-MCP%20JSON--RPC-cyan.svg" alt="MCP">
   <img src="https://img.shields.io/badge/vault-SQLite%20Local-yellow.svg" alt="Vault">
@@ -48,11 +48,11 @@ Prinsipnya **zero-knowledge**: Google cuma nerima blob ciphertext acak (`gde_<la
 
 - **ChaCha20-Poly1305 (256-bit AEAD)**: Standar IETF RFC 8439. Cepat, ringan di CPU, dan kebal cache-timing attack tanpa butuh akselerasi hardware AES-NI.
 - **Kunci Unik per File**: Setiap file dienkripsi dengan kunci 32-byte independen (`secrets.token_bytes(32)`). Tidak ada master key tunggal.
-- **Smart Packing**: File tunggal langsung dienkripsi tanpa overhead ZIP. Folder otomatis di-zip rekursif sebelum dienkripsi.
+- **Smart Packing**: File tunggal langsung dienkripsi tanpa overhead ZIP. Folder otomatis di-zip rekursif sebelum dienkripsi dengan mempertahankan permission executable (`0755`) dan struktur subfolder kosong.
 - **Anti-Tampering**: Label file terikat ke AAD (Additional Authenticated Data). Kalau isi file atau label dimanipulasi, tag Poly1305 langsung menolak dekripsi.
-- **Vault Lokal Terisolasi**: SQLite lokal disimpan dengan permission ketat (`chmod 600`). Kunci tidak pernah dikirim ke jaringan.
+- **Vault Lokal & Backup Kunci**: SQLite lokal disimpan dengan permission ketat (`chmod 600`). Dilengkapi perintah `export-keys` dan `import-keys` untuk backup/migrasi kunci.
 - **Tampilan CLI Rapi**: Output tabel berwarna dengan opsi download interaktif.
-- **Native MCP Integration**: Komunikasi langsung ke server Google Drive MCP lewat stdio JSON-RPC.
+- **Native MCP Integration**: Komunikasi langsung ke server Google Drive MCP lewat stdio JSON-RPC (resilient terhadap log stdout).
 
 ---
 
@@ -193,9 +193,27 @@ Kalau cuma mau enkripsi lokal tanpa upload ke GDrive:
 ```bash
 gde --local rahasia.txt
 ```
+File terenkripsi disimpan langsung di folder aktif sebagai `rahasia.txt.enc`.
+
+### Dekripsi File Lokal
+Untuk mendekripsi kembali file `.enc` yang ada di mesin:
+```bash
+gde decrypt rahasia.txt.enc
+```
+GDE otomatis membaca label di header file, mengambil kunci yang cocok dari vault lokal, dan memulihkan file/folder aslinya.
+
+### Backup & Restore Kunci Vault
+Semua kunci tersimpan di database lokal. Anda bisa mem-backup seluruh kunci ke file JSON terenkripsi/aman:
+```bash
+# Export semua kunci vault ke file JSON
+gde export-keys cadangan-kunci.json
+
+# Import kunci dari backup JSON ke mesin baru
+gde import-keys cadangan-kunci.json
+```
 
 ### Jalankan Self-Test
-Buat ngecek fungsi enkripsi, kompresi, dan deteksi tampering di sistem kamu:
+Buat ngecek fungsi enkripsi, permission zip, dan deteksi tampering di sistem kamu:
 ```bash
 gde test
 ```

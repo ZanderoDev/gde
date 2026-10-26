@@ -2,7 +2,7 @@
 """
 gde - Google Drive Encryption CLI
 Military-grade local encryption (ChaCha20-Poly1305) + local key vault + Google Drive MCP.
-Direct file encryption (no zip) for single files, zip only for directories.
+Direct file encryption (no zip) for single files, faithful zip for directories.
 """
 
 import sys
@@ -14,11 +14,13 @@ import secrets
 import shutil
 import tempfile
 import subprocess
+import stat
 from pathlib import Path
 from datetime import datetime
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.exceptions import InvalidTag
 except ImportError:
     print("Error: 'cryptography' library required. Run: pip install cryptography", file=sys.stderr)
     sys.exit(1)
@@ -114,7 +116,7 @@ class GDriveMCP:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "gde-cli", "version": "1.0.0"}
+                    "clientInfo": {"name": "gde-cli", "version": "1.1.0"}
                 }
             })
             if "error" in init_res:
@@ -125,13 +127,31 @@ class GDriveMCP:
             raise RuntimeError("Command 'npx' tidak ditemukan. Pastikan Node.js terinstall.")
 
     def _send(self, req):
+        req_id = req.get("id")
         self.proc.stdin.write(json.dumps(req) + "\n")
         self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
-        if not line:
-            err = self.proc.stderr.read()
-            raise RuntimeError(f"MCP server closed: {err}")
-        return json.loads(line)
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                err = ""
+                if self.proc.stderr:
+                    try:
+                        err = self.proc.stderr.read()
+                    except Exception:
+                        pass
+                raise RuntimeError(f"MCP server closed: {err}")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                # Skip non-JSON output lines (e.g. server stdout logs)
+                continue
+            # If request specified id, match response id
+            if req_id is not None and data.get("id") != req_id:
+                continue
+            return data
 
     def call_tool(self, tool_name, arguments):
         req = {
@@ -162,14 +182,14 @@ class GDriveMCP:
             data = json.loads(text_out)
             file_id = data.get("fileId") or data.get("id")
             if file_id:
-                return file_id
+                return str(file_id)
         except Exception:
             pass
         import re
         m = re.search(r"(?:fileId|id)['\"]?:\s*['\"]([^'\"]+)['\"]", text_out, re.IGNORECASE)
         if m:
             return m.group(1)
-        return "uploaded"
+        raise RuntimeError(f"Gagal mengambil fileId dari response Google Drive MCP: {text_out[:200]}")
 
     def download_file(self, file_id, local_path):
         self.call_tool("downloadFile", {
@@ -188,19 +208,49 @@ class GDriveMCP:
 
 
 def compress_directory(src_dir, out_zip):
+    """Compress directory preserving empty folders and file permissions."""
     src = Path(src_dir).resolve()
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(src):
+        for root, dirs, files in os.walk(src):
+            root_p = Path(root)
+            for d in dirs:
+                dir_p = root_p / d
+                rel_p = dir_p.relative_to(src).as_posix() + "/"
+                zinfo = zipfile.ZipInfo(rel_p)
+                mode = dir_p.stat().st_mode
+                zinfo.external_attr = (mode & 0xFFFF) << 16
+                zf.writestr(zinfo, b"")
             for f in files:
-                full_p = Path(root) / f
-                rel_p = full_p.relative_to(src)
-                zf.write(full_p, rel_p)
+                full_p = root_p / f
+                rel_p = full_p.relative_to(src).as_posix()
+                mode = full_p.stat().st_mode
+                with open(full_p, "rb") as fp:
+                    data = fp.read()
+                zinfo = zipfile.ZipInfo(rel_p)
+                zinfo.external_attr = (mode & 0xFFFF) << 16
+                zinfo.compress_type = zipfile.ZIP_DEFLATED
+                zf.writestr(zinfo, data)
+
+
+def extract_zip_faithful(zip_path, dest_dir):
+    """Extract zip preserving directory hierarchy and POSIX file permissions."""
+    dest = Path(dest_dir).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            extracted = Path(zf.extract(member, dest))
+            perm = (member.external_attr >> 16) & 0o777
+            if perm:
+                try:
+                    os.chmod(extracted, perm)
+                except Exception:
+                    pass
 
 
 def encrypt_data(raw_bytes, label):
     """
-    ChaCha20-Poly1305 military grade cipher.
-    Per-file 256-bit key.
+    ChaCha20-Poly1305 AEAD cipher (IETF RFC 8439).
+    Per-file 256-bit unique key + 96-bit nonce.
     Format: MAGIC(4) + label_len(1) + label(N) + nonce(12) + ciphertext + tag(16)
     AAD = label (tamper protection for label matching).
     """
@@ -219,7 +269,7 @@ def encrypt_data(raw_bytes, label):
 
 
 def decrypt_data(enc_bytes, key):
-    """Decrypt and verify integrity."""
+    """Decrypt and verify integrity via Poly1305 auth tag."""
     if len(enc_bytes) < 4 + 1 + 12 + 16:
         raise ValueError("File terenkripsi tidak valid: ukuran terlalu pendek.")
     magic = enc_bytes[:4]
@@ -236,6 +286,17 @@ def decrypt_data(enc_bytes, key):
 
     cipher = ChaCha20Poly1305(key)
     return cipher.decrypt(nonce, ct, associated_data=label.encode("utf-8")), label
+
+
+def confirm_overwrite(dest_path):
+    """Prompt user if destination already exists."""
+    if not dest_path.exists():
+        return True
+    if not sys.stdin.isatty():
+        return True
+    prompt = f"{C.YELLOW}[!]{C.RESET} Target '{C.BOLD}{dest_path}{C.RESET}' sudah ada. Timpa? [y/N]: "
+    ans = input(prompt).strip().lower()
+    return ans in ("y", "yes")
 
 
 def cmd_encrypt(path_str, local_only=False):
@@ -255,7 +316,7 @@ def cmd_encrypt(path_str, local_only=False):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        enc_path = tmp / f"{label}.enc"
+        temp_enc = tmp / f"{label}.enc"
 
         if is_dir:
             log_info(f"Target adalah {C.MAGENTA}folder{C.RESET} -> Kompres ke ZIP...")
@@ -270,25 +331,60 @@ def cmd_encrypt(path_str, local_only=False):
 
         log_info("Mengenkripsi dengan ChaCha20-Poly1305 (256-bit key unik)...")
         enc_bytes, key = encrypt_data(raw_bytes, label)
-        with open(enc_path, "wb") as f:
+        with open(temp_enc, "wb") as f:
             f.write(enc_bytes)
 
         drive_file_id = None
-        if not local_only:
-            log_info("Mengunggah ke Google Drive via MCP...")
-            mcp = GDriveMCP()
-            try:
-                mcp.start()
-                drive_file_id = mcp.upload_file(enc_path, f"{label}.enc")
-                log_success(f"Berhasil upload. Drive ID: {C.GREEN}{drive_file_id}{C.RESET}")
-            except Exception as e:
-                log_err(f"GDrive MCP Error: {e}")
-                log_warn("Menyimpan enkripsi di database lokal tanpa ID Drive.")
-            finally:
-                mcp.close()
-
-        # Simpan ke DB lokal
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if local_only:
+            # Mode lokal: simpan file .enc di direktori kerja saat ini
+            out_enc = Path.cwd() / f"{target.name}.enc"
+            if not confirm_overwrite(out_enc):
+                log_warn("Dibatalkan oleh pengguna.")
+                return
+            shutil.copy2(temp_enc, out_enc)
+            conn.execute(
+                """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (label, target.name, str(target), is_dir, size_bytes, key.hex(), None, created_at)
+            )
+            conn.commit()
+            log_success(f"File terenkripsi disimpan ke: {C.BOLD}{C.GREEN}{out_enc}{C.RESET}")
+            log_success(f"Kunci tersimpan di vault lokal: {C.DIM}{DB_PATH}{C.RESET}")
+            log_info(f"Untuk restore lokal: {C.GREEN}gde decrypt {out_enc.name}{C.RESET}")
+            log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi lokal.")
+            return
+
+        # Mode online: upload via Google Drive MCP
+        log_info("Mengunggah ke Google Drive via MCP...")
+        mcp = GDriveMCP()
+        upload_err = None
+        try:
+            mcp.start()
+            drive_file_id = mcp.upload_file(temp_enc, f"{label}.enc")
+            log_success(f"Berhasil upload. Drive ID: {C.GREEN}{drive_file_id}{C.RESET}")
+        except Exception as e:
+            upload_err = e
+        finally:
+            mcp.close()
+
+        if upload_err:
+            # Cegah hilangnya ciphertext: selamatkan ke disk lokal
+            fallback_enc = Path.cwd() / f"{target.name}.enc"
+            shutil.copy2(temp_enc, fallback_enc)
+            conn.execute(
+                """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (label, target.name, str(target), is_dir, size_bytes, key.hex(), None, created_at)
+            )
+            conn.commit()
+            log_err(f"GDrive MCP Error: {upload_err}")
+            log_warn(f"Upload gagal. File terenkripsi diamankan ke: {C.BOLD}{fallback_enc}{C.RESET}")
+            log_info(f"Kunci tersimpan di vault. Untuk restore lokal: {C.GREEN}gde decrypt {fallback_enc.name}{C.RESET}")
+            sys.exit(1)
+
+        # Sukses upload online
         conn.execute(
             """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -296,7 +392,84 @@ def cmd_encrypt(path_str, local_only=False):
         )
         conn.commit()
         log_success(f"Kunci & metadata aman tersimpan di {C.DIM}{DB_PATH}{C.RESET}")
-        log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi penuh.")
+        log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi penuh di cloud.")
+
+
+def cmd_decrypt_file(enc_path_str, dest_dir="."):
+    """Decrypt a local .enc file using the key from local vault or user input."""
+    enc_path = Path(enc_path_str).expanduser().resolve()
+    if not enc_path.exists():
+        log_err(f"File terenkripsi '{enc_path}' tidak ditemukan.")
+        sys.exit(1)
+
+    log_info(f"Membaca file terenkripsi: {C.BOLD}{enc_path.name}{C.RESET}")
+    with open(enc_path, "rb") as f:
+        enc_data = f.read()
+
+    if len(enc_data) < 5:
+        log_err("Format file tidak valid (terlalu pendek).")
+        sys.exit(1)
+
+    magic = enc_data[:4]
+    if magic not in (MAGIC_GDE, MAGIC_EGD):
+        log_err("Bukan file terenkripsi GDE/EGD.")
+        sys.exit(1)
+
+    label_len = enc_data[4]
+    label = enc_data[5:5 + label_len].decode("utf-8", errors="ignore")
+    log_info(f"Terdeteksi label: {C.GREEN}{label}{C.RESET}")
+
+    conn = init_db()
+    cur = conn.cursor()
+    cur.execute("SELECT original_name, is_dir, enc_key FROM vault WHERE label = ?", (label,))
+    row = cur.fetchone()
+
+    if row:
+        name, is_dir, key_hex = row
+        key = bytes.fromhex(key_hex)
+        log_info(f"Kunci ditemukan di vault untuk file: {C.BOLD}{name}{C.RESET}")
+    else:
+        log_warn("Kunci untuk label ini tidak ditemukan di database vault lokal.")
+        key_input = input(f"{C.CYAN}Masukkan 64-karakter hex key (atau 'q' keluar): {C.RESET}").strip()
+        if not key_input or key_input.lower() == "q":
+            return
+        try:
+            key = bytes.fromhex(key_input)
+            if len(key) != 32:
+                raise ValueError("Panjang kunci harus 32 byte (64 hex characters)")
+        except ValueError as ve:
+            log_err(f"Kunci tidak valid: {ve}")
+            return
+        name = enc_path.stem
+        is_dir = 0
+
+    try:
+        dec_bytes, extracted_label = decrypt_data(enc_data, key)
+        if extracted_label != label:
+            raise ValueError("Label mismatch tag")
+    except InvalidTag:
+        log_err("Gagal dekripsi: Kunci salah atau data telah diubah/korup (InvalidTag)!")
+        sys.exit(1)
+    except Exception as e:
+        log_err(f"Gagal dekripsi: {e}")
+        sys.exit(1)
+
+    dest = Path(dest_dir).resolve() / name
+    if not confirm_overwrite(dest):
+        log_warn("Dibatalkan oleh pengguna.")
+        return
+
+    if is_dir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_zip = Path(tmpdir) / "restored.zip"
+            tmp_zip.write_bytes(dec_bytes)
+            log_info(f"Mengekstrak folder ke: {C.BOLD}{dest}{C.RESET}")
+            extract_zip_faithful(tmp_zip, dest)
+    else:
+        log_info(f"Menulis file ke: {C.BOLD}{dest}{C.RESET}")
+        dest.write_bytes(dec_bytes)
+
+    log_done(f"Berhasil didekripsi ke: {C.BOLD}{C.GREEN}{dest}{C.RESET}")
 
 
 def cmd_list():
@@ -336,25 +509,30 @@ def cmd_list():
         if not pilihan or pilihan.lower() == "q":
             return
         item_id = int(pilihan)
-        cmd_download(item_id)
-    except (ValueError, KeyboardInterrupt):
+    except KeyboardInterrupt:
         print("\nDibatalkan.")
+        return
+    except ValueError:
+        log_err("Input tidak valid: Masukkan angka nomor file.")
+        return
+
+    cmd_download(item_id)
 
 
 def cmd_download(item_id_or_label, dest_dir="."):
     conn = init_db()
     cur = conn.cursor()
     if isinstance(item_id_or_label, int) or str(item_id_or_label).isdigit():
-        cur.execute("SELECT id, label, original_name, is_dir, enc_key, drive_file_id FROM vault WHERE id = ?", (int(item_id_or_label),))
+        cur.execute("SELECT id, label, original_name, original_path, is_dir, enc_key, drive_file_id FROM vault WHERE id = ?", (int(item_id_or_label),))
     else:
-        cur.execute("SELECT id, label, original_name, is_dir, enc_key, drive_file_id FROM vault WHERE label = ? OR original_name = ?", (str(item_id_or_label), str(item_id_or_label)))
+        cur.execute("SELECT id, label, original_name, original_path, is_dir, enc_key, drive_file_id FROM vault WHERE label = ? OR original_name = ?", (str(item_id_or_label), str(item_id_or_label)))
 
     row = cur.fetchone()
     if not row:
         log_err(f"Data '{item_id_or_label}' tidak ditemukan di vault.")
         return
 
-    _, label, name, is_dir, key_hex, drive_file_id = row
+    _, label, name, original_path, is_dir, key_hex, drive_file_id = row
     key = bytes.fromhex(key_hex)
     dest = Path(dest_dir).resolve() / name
 
@@ -365,16 +543,32 @@ def cmd_download(item_id_or_label, dest_dir="."):
         enc_file = tmp / f"{label}.enc"
 
         if not drive_file_id:
-            log_err("Item ini belum terunggah ke Google Drive (hanya ada metadata lokal).")
-            return
-
-        log_info(f"Mengunduh dari GDrive (ID: {C.GREEN}{drive_file_id}{C.RESET}) via MCP...")
-        mcp = GDriveMCP()
-        try:
-            mcp.start()
-            mcp.download_file(drive_file_id, enc_file)
-        finally:
-            mcp.close()
+            # File lokal: periksa keberadaan file .enc lokal
+            candidates = [
+                Path.cwd() / f"{name}.enc",
+                Path.cwd() / f"{label}.enc",
+                Path(original_path).parent / f"{name}.enc"
+            ]
+            found = None
+            for cand in candidates:
+                if cand.exists():
+                    found = cand
+                    break
+            if found:
+                log_info(f"Menggunakan ciphertext lokal: {C.BOLD}{found}{C.RESET}")
+                enc_file = found
+            else:
+                log_err("Item ini tersimpan lokal (tanpa ID GDrive) dan file .enc tidak ditemukan di folder saat ini.")
+                log_info(f"Jalankan: {C.GREEN}gde decrypt <path/ke/{name}.enc>{C.RESET}")
+                return
+        else:
+            log_info(f"Mengunduh dari GDrive (ID: {C.GREEN}{drive_file_id}{C.RESET}) via MCP...")
+            mcp = GDriveMCP()
+            try:
+                mcp.start()
+                mcp.download_file(drive_file_id, enc_file)
+            finally:
+                mcp.close()
 
         if not enc_file.exists():
             log_err("Gagal: File hasil download tidak ditemukan.")
@@ -388,28 +582,95 @@ def cmd_download(item_id_or_label, dest_dir="."):
             dec_bytes, extracted_label = decrypt_data(enc_data, key)
             if extracted_label != label:
                 raise ValueError("Mismatch label tag")
+        except InvalidTag:
+            log_err("Gagal dekripsi: Tag otentikasi tidak valid (data korup atau kunci salah)!")
+            return
         except Exception as e:
-            log_err(f"Gagal dekripsi! Data korup atau kunci salah: {e}")
+            log_err(f"Gagal dekripsi: {e}")
+            return
+
+        if not confirm_overwrite(dest):
+            log_warn("Dibatalkan oleh pengguna.")
             return
 
         if is_dir:
             log_info(f"Folder terdeteksi -> Mengekstrak ZIP ke: {C.BOLD}{dest}{C.RESET}")
-            dest.mkdir(parents=True, exist_ok=True)
             decrypted_zip = tmp / "restored.zip"
-            with open(decrypted_zip, "wb") as f:
-                f.write(dec_bytes)
-            with zipfile.ZipFile(decrypted_zip, "r") as zf:
-                zf.extractall(dest)
+            decrypted_zip.write_bytes(dec_bytes)
+            extract_zip_faithful(decrypted_zip, dest)
         else:
             log_info(f"File tunggal terdeteksi -> Menulis langsung (tanpa ZIP) ke: {C.BOLD}{dest}{C.RESET}")
-            with open(dest, "wb") as f:
-                f.write(dec_bytes)
+            dest.write_bytes(dec_bytes)
 
         log_done(f"Berhasil di-restore ke: {C.BOLD}{C.GREEN}{dest}{C.RESET}")
 
 
+def cmd_export_keys(out_path=None):
+    """Export vault database to a backup JSON file."""
+    conn = init_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at FROM vault")
+    rows = cur.fetchall()
+
+    data = []
+    for r in rows:
+        data.append({
+            "id": r[0],
+            "label": r[1],
+            "original_name": r[2],
+            "original_path": r[3],
+            "is_dir": r[4],
+            "size_bytes": r[5],
+            "enc_key": r[6],
+            "drive_file_id": r[7],
+            "created_at": r[8]
+        })
+
+    if not out_path:
+        out_path = Path.home() / ".config" / "gde" / f"vault-backup-{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+    else:
+        out_path = Path(out_path).resolve()
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(out_path, 0o600)
+    log_done(f"Vault berhasil di-export ke: {C.BOLD}{C.GREEN}{out_path}{C.RESET} ({len(data)} entri)")
+    log_warn("PENTING: File backup berisi kunci rahasia. Simpan di tempat yang sangat aman!")
+
+
+def cmd_import_keys(in_path):
+    """Import keys from a backup JSON file."""
+    path = Path(in_path).expanduser().resolve()
+    if not path.exists():
+        log_err(f"File backup '{path}' tidak ditemukan.")
+        sys.exit(1)
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        log_err("Format backup JSON tidak valid.")
+        sys.exit(1)
+
+    conn = init_db()
+    count = 0
+    for item in data:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM vault WHERE label = ?", (item["label"],))
+        if not cur.fetchone():
+            conn.execute(
+                """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (item["label"], item["original_name"], item["original_path"], item["is_dir"],
+                 item["size_bytes"], item["enc_key"], item.get("drive_file_id"), item["created_at"])
+            )
+            count += 1
+    conn.commit()
+    log_done(f"Berhasil mengimpor {C.BOLD}{count}{C.RESET} kunci baru ke vault.")
+
+
 def self_test():
-    """Assert-based self-check for single file (no zip), directory (zip), and tamper detection."""
+    """Deterministic verification for single file, directory, and tamper detection."""
     log_info("Menjalankan self-test GDE...")
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -421,40 +682,87 @@ def self_test():
 
         label_file = "gde_testfile01"
         enc_file, key_file = encrypt_data(file_path.read_bytes(), label_file)
-        assert enc_file[:4] == MAGIC_GDE, "Magic header mismatch on file"
+        if enc_file[:4] != MAGIC_GDE:
+            raise RuntimeError("Magic header mismatch on single file")
 
         # Decrypt single file
         dec_file, lbl = decrypt_data(enc_file, key_file)
-        assert lbl == label_file, "Label mismatch on file"
-        assert dec_file == test_content, "Decrypted content mismatch on single file"
+        if lbl != label_file:
+            raise RuntimeError("Label mismatch on single file")
+        if dec_file != test_content:
+            raise RuntimeError("Decrypted content mismatch on single file")
 
-        # 2. Test Directory (With zip)
+        # 2. Test Directory with faithful permissions & empty dir
         folder_path = tmp / "my_folder"
         folder_path.mkdir()
-        (folder_path / "sub.txt").write_text("Hello inside folder", encoding="utf-8")
+        empty_sub = folder_path / "empty_sub"
+        empty_sub.mkdir()
+        script_file = folder_path / "script.sh"
+        script_file.write_text("#!/bin/sh\necho test\n")
+        script_file.chmod(0o755)
+
         zip_p = tmp / "folder.zip"
         compress_directory(folder_path, zip_p)
-        assert zip_p.exists(), "Folder zip compression failed"
+        if not zip_p.exists():
+            raise RuntimeError("Folder zip compression failed")
 
         label_dir = "gde_testdir02"
         enc_dir, key_dir = encrypt_data(zip_p.read_bytes(), label_dir)
         dec_dir, lbl_dir = decrypt_data(enc_dir, key_dir)
-        assert lbl_dir == label_dir, "Label mismatch on directory"
-        assert dec_dir == zip_p.read_bytes(), "Decrypted zip bytes mismatch"
+        if lbl_dir != label_dir:
+            raise RuntimeError("Label mismatch on directory")
+        if dec_dir != zip_p.read_bytes():
+            raise RuntimeError("Decrypted zip bytes mismatch")
 
-        # 3. Tamper test (Poly1305 authentication tag check)
-        tampered = bytearray(enc_file)
-        tampered[-1] ^= 0x01
+        restore_dir = tmp / "restored_folder"
+        restore_zip = tmp / "restored.zip"
+        restore_zip.write_bytes(dec_dir)
+        extract_zip_faithful(restore_zip, restore_dir)
+
+        if not (restore_dir / "empty_sub").is_dir():
+            raise RuntimeError("Empty subfolder not preserved in zip restore")
+        restored_script = restore_dir / "script.sh"
+        if not restored_script.is_file():
+            raise RuntimeError("script.sh missing in restored folder")
+        restored_mode = stat.S_IMODE(restored_script.stat().st_mode)
+        if restored_mode != 0o755:
+            raise RuntimeError(f"Permissions not preserved: expected 0o755, got {oct(restored_mode)}")
+
+        # 3. Tamper test: Corrupted ciphertext MUST fail decryption
+        tampered_cipher = bytearray(enc_file)
+        tampered_cipher[-1] ^= 0x01
         try:
-            decrypt_data(bytes(tampered), key_file)
-            assert False, "Tamper detection failed! Corrupted ciphertext must be rejected."
+            decrypt_data(bytes(tampered_cipher), key_file)
         except Exception:
-            pass
+            pass  # Expected to fail
+        else:
+            raise RuntimeError("Tamper detection failed! Corrupted ciphertext was accepted.")
+
+        # 4. Tamper test: Tampered label in header MUST fail decryption
+        tampered_header = bytearray(enc_file)
+        tampered_header[5] ^= 0x01  # Flip one byte in label
+        try:
+            decrypt_data(bytes(tampered_header), key_file)
+        except Exception:
+            pass  # Expected to fail
+        else:
+            raise RuntimeError("Tamper detection failed! Tampered label was accepted.")
+
+        # 5. Wrong key MUST fail decryption
+        wrong_key = secrets.token_bytes(32)
+        try:
+            decrypt_data(enc_file, wrong_key)
+        except Exception:
+            pass  # Expected to fail
+        else:
+            raise RuntimeError("Key verification failed! Wrong key was accepted.")
 
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} Folder (zip + encrypt): {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} ChaCha20-Poly1305 Tamper detection: {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Folder (empty dirs + permissions preserved): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} ChaCha20-Poly1305 Ciphertext Tamper check: {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} AAD Label Tamper check: {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Wrong Key Rejection: {C.GREEN}OK{C.RESET}")
 
 
 def main():
@@ -464,29 +772,45 @@ def main():
         print(f"{C.BOLD}{C.CYAN}  ╚═════════════════════════════════════════════════════════════╝{C.RESET}\n")
         print(f"{C.BOLD}Penggunaan:{C.RESET}")
         print(f"  {C.GREEN}gde {C.CYAN}<file/folder>{C.RESET}       Enkripsi & upload ke GDrive (file langsung, folder di-zip)")
-        print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}      Enkripsi lokal saja (tanpa upload)")
+        print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}      Enkripsi lokal -> simpan ke <nama>.enc")
+        print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}  Dekripsi file .enc lokal menggunakan kunci vault")
         print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                Daftar file di vault & download interaktif")
-        print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET} Download & dekripsi langsung")
+        print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET} Download dari GDrive & pulihkan langsung")
+        print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}  Export cadangan kunci vault ke file JSON")
+        print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}  Import kunci vault dari file JSON")
         print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                Jalankan internal verification self-test\n")
         sys.exit(0)
 
-    arg = sys.argv[1]
-    if arg == "list":
+    cmd = sys.argv[1]
+    if cmd == "list":
         cmd_list()
-    elif arg == "download":
+    elif cmd == "download":
         if len(sys.argv) < 3:
-            print("Error: Berikan ID atau Label file.", file=sys.stderr)
+            log_err("Berikan ID atau Label file.")
             sys.exit(1)
         cmd_download(sys.argv[2])
-    elif arg == "test":
-        self_test()
-    elif arg == "--local":
+    elif cmd == "decrypt":
         if len(sys.argv) < 3:
-            print("Error: Berikan path file/folder.", file=sys.stderr)
+            log_err("Berikan path ke file .enc (contoh: gde decrypt dokumen.md.enc)")
+            sys.exit(1)
+        cmd_decrypt_file(sys.argv[2])
+    elif cmd == "export-keys":
+        out_file = sys.argv[2] if len(sys.argv) > 2 else None
+        cmd_export_keys(out_file)
+    elif cmd == "import-keys":
+        if len(sys.argv) < 3:
+            log_err("Berikan path file JSON backup.")
+            sys.exit(1)
+        cmd_import_keys(sys.argv[2])
+    elif cmd == "test":
+        self_test()
+    elif cmd == "--local":
+        if len(sys.argv) < 3:
+            log_err("Berikan path file/folder.")
             sys.exit(1)
         cmd_encrypt(sys.argv[2], local_only=True)
     else:
-        cmd_encrypt(arg, local_only=False)
+        cmd_encrypt(cmd, local_only=False)
 
 
 if __name__ == "__main__":
