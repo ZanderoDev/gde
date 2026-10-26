@@ -1,3 +1,14 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="GDE Banner" width="100%">
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/cipher-ChaCha20--Poly1305-emerald.svg" alt="Cipher">
+  <img src="https://img.shields.io/badge/protocol-MCP%20JSON--RPC-cyan.svg" alt="MCP">
+  <img src="https://img.shields.io/badge/vault-SQLite%20Local-yellow.svg" alt="Vault">
+</p>
+
 # GDE (Google Drive Encryption)
 
 CLI tool buat enkripsi file atau folder secara lokal sebelum di-upload ke Google Drive via MCP (`@piotr-agier/google-drive-mcp`).
