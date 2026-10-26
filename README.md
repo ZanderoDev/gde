@@ -203,13 +203,21 @@ gde decrypt rahasia.txt.enc
 GDE otomatis membaca label di header file, mengambil kunci yang cocok dari vault lokal, dan memulihkan file/folder aslinya.
 
 ### Backup & Restore Kunci Vault
-Semua kunci tersimpan di database lokal. Anda bisa mem-backup seluruh kunci ke file JSON terenkripsi/aman:
+Semua kunci tersimpan di database lokal `vault.db`. Anda bisa mengekspor daftar kunci ke file JSON cadangan (dibuat dengan izin ketat `chmod 600`):
 ```bash
-# Export semua kunci vault ke file JSON
+# Export semua kunci vault ke file JSON (disimpan atomic 0600)
 gde export-keys cadangan-kunci.json
 
-# Import kunci dari backup JSON ke mesin baru
+# Import kunci dari file backup JSON ke mesin baru
 gde import-keys cadangan-kunci.json
+```
+> **Catatan:** File export berisi kunci plaintext. Pastikan disimpan di media penyimpanan yang aman (misalnya drive terenkripsi/LUKS).
+
+### Opsi Timpa File (--force)
+Secara default, GDE akan meminta konfirmasi `[y/N]` sebelum menimpa file yang sudah ada. Pada lingkungan non-interaktif (script/cron), tambahkan flag `--force` atau `-f`:
+```bash
+gde download 1 --force
+gde decrypt dokumen.md.enc -f
 ```
 
 ### Jalankan Self-Test
