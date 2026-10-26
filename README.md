@@ -48,9 +48,10 @@ Prinsipnya **zero-knowledge**: Google cuma nerima blob ciphertext acak (`gde_<la
 
 - **ChaCha20-Poly1305 (256-bit AEAD)**: Standar IETF RFC 8439. Cepat, ringan di CPU, dan kebal cache-timing attack tanpa butuh akselerasi hardware AES-NI.
 - **Kunci Unik per File**: Setiap file dienkripsi dengan kunci 32-byte independen (`secrets.token_bytes(32)`). Tidak ada master key tunggal.
-- **Smart Packing**: File tunggal langsung dienkripsi tanpa overhead ZIP. Folder otomatis di-zip rekursif sebelum dienkripsi dengan mempertahankan permission executable (`0755`) dan struktur subfolder kosong.
+- **Smart Packing**: File tunggal langsung dienkripsi tanpa overhead ZIP. Folder otomatis di-zip rekursif sebelum dienkripsi dengan mempertahankan permission executable (`0755`), direktori read-only (`0555`), symlink (relatif & absolut), dan subfolder kosong. Dilengkapi proteksi Zip Slip.
 - **Anti-Tampering**: Label file terikat ke AAD (Additional Authenticated Data). Kalau isi file atau label dimanipulasi, tag Poly1305 langsung menolak dekripsi.
 - **Vault Lokal & Backup Kunci**: SQLite lokal disimpan dengan permission ketat (`chmod 600`). Dilengkapi perintah `export-keys` dan `import-keys` untuk backup/migrasi kunci.
+- **Deteksi Akses & Peringatan**: File/folder yang tidak dapat dibaca (`PermissionError`) atau file khusus (FIFO/device) dideteksi dan dilaporkan eksplisit (exit code 2 untuk backup parsial kecuali `--force`).
 - **Tampilan CLI Rapi**: Output tabel berwarna dengan opsi download interaktif.
 - **Native MCP Integration**: Komunikasi langsung ke server Google Drive MCP lewat stdio JSON-RPC (resilient terhadap log stdout).
 

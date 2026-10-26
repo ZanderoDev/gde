@@ -95,6 +95,15 @@ def init_db():
     return conn
 
 
+def is_subpath(child, parent):
+    """Check if child path resolves within parent path."""
+    try:
+        Path(child).resolve().relative_to(Path(parent).resolve())
+        return True
+    except ValueError:
+        return False
+
+
 class GDriveMCP:
     """Communicate with @piotr-agier/google-drive-mcp via stdio JSON-RPC."""
 
@@ -135,7 +144,6 @@ class GDriveMCP:
                 text=True,
                 bufsize=1
             )
-            # Background reader threads prevent buffer deadlocks & select/readline mismatch
             t_out = threading.Thread(target=self._drain_stdout, daemon=True)
             t_err = threading.Thread(target=self._drain_stderr, daemon=True)
             t_out.start()
@@ -149,7 +157,7 @@ class GDriveMCP:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "gde-cli", "version": "1.3.0"}
+                    "clientInfo": {"name": "gde-cli", "version": "1.3.1"}
                 }
             })
             if "error" in init_res:
@@ -185,7 +193,6 @@ class GDriveMCP:
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
-                # Lewati baris log non-JSON dari server stdout
                 continue
 
             if req_id is not None and data.get("id") != req_id:
@@ -248,13 +255,16 @@ class GDriveMCP:
 
 
 def compress_directory(src_dir, out_zip):
-    """Compress directory preserving empty folders, symlinks, and file permissions. Safely skips FIFOs."""
+    """Compress directory preserving empty folders, all symlinks, and file permissions. Safely skips FIFOs."""
     src = Path(src_dir).resolve()
     unreadable = []
     special_files = []
 
+    def on_walk_err(err):
+        unreadable.append((err.filename, str(err)))
+
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(src, followlinks=False):
+        for root, dirs, files in os.walk(src, followlinks=False, onerror=on_walk_err):
             root_p = Path(root)
 
             for d in dirs:
@@ -305,59 +315,55 @@ def compress_directory(src_dir, out_zip):
                     zinfo.compress_type = zipfile.ZIP_DEFLATED
                     zf.writestr(zinfo, data)
                 else:
-                    # Skip special files (FIFO, socket, block/char dev) to prevent hanging
                     special_files.append(str(full_p))
 
-    if special_files:
-        log_warn(f"{len(special_files)} file khusus (FIFO/socket/device) dilewati untuk mencegah hang.")
-    if unreadable:
-        log_warn(f"{len(unreadable)} file tidak dapat dibaca karena masalah izin/akses:")
-        for upath, uerr in unreadable[:5]:
-            print(f"    {C.GRAY}• {upath}: {uerr}{C.RESET}")
-        if len(unreadable) > 5:
-            print(f"    {C.GRAY}...dan {len(unreadable) - 5} file lainnya.{C.RESET}")
+    return unreadable, special_files
 
 
 def extract_zip_faithful(zip_path, dest_dir):
-    """Extract zip with Zip Slip protection, preserving directory hierarchy, symlinks, and POSIX permissions."""
+    """Extract zip with Zip Slip protection while fully preserving relative and absolute symlinks."""
     dest = Path(dest_dir).resolve()
     dest.mkdir(parents=True, exist_ok=True)
     dir_perms = []
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         for member in zf.infolist():
-            # Zip Slip defense: pastikan target path selalu di dalam dest
-            target_path = (dest / member.filename).resolve()
-            try:
-                target_path.relative_to(dest)
-            except ValueError:
-                log_warn(f"Entri arsip berbahaya ditolak (Zip Slip attempt): {member.filename}")
+            # 1. Tolak nama entri yang memakai path traversal
+            if member.filename.startswith("/") or ".." in member.filename.split("/"):
+                log_warn(f"Entri arsip berbahaya ditolak (Path Traversal attempt): {member.filename}")
                 continue
 
+            target_path = dest / member.filename
             perm = (member.external_attr >> 16) & 0xFFFF
             is_symlink = stat.S_ISLNK(perm)
             is_dir = member.filename.endswith("/")
 
             if is_symlink:
+                # Lokasi inode symlink harus berada di dalam dest
+                if not is_subpath(target_path.parent, dest):
+                    log_warn(f"Lokasi symlink di luar batas ditolak: {member.filename}")
+                    continue
+
                 link_target = zf.read(member).decode("utf-8")
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 if target_path.exists() or os.path.islink(target_path):
                     target_path.unlink()
-                # Tolak symlink absolut yang mengarah ke luar folder dest
-                if os.path.isabs(link_target):
-                    try:
-                        Path(link_target).resolve().relative_to(dest)
-                    except ValueError:
-                        log_warn(f"Symlink absolut keluar batas ditolak: {member.filename} -> {link_target}")
-                        continue
                 try:
                     os.symlink(link_target, target_path)
                 except OSError:
                     pass
             elif is_dir:
+                if not is_subpath(target_path, dest):
+                    log_warn(f"Direktori di luar batas ditolak: {member.filename}")
+                    continue
                 target_path.mkdir(parents=True, exist_ok=True)
                 dir_perms.append((target_path, perm & 0o777))
             else:
+                # File biasa: parent path harus resolve di dalam dest (mencegah penulisan via symlink!)
+                if not is_subpath(target_path.parent, dest):
+                    log_warn(f"Penulisan file melewati symlink ditolak: {member.filename}")
+                    continue
+
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 extracted = Path(zf.extract(member, dest))
                 file_perm = perm & 0o777
@@ -367,7 +373,7 @@ def extract_zip_faithful(zip_path, dest_dir):
                     except Exception:
                         pass
 
-    # Terapkan izin direktori setelah seluruh isi selesai diekstrak (dari path terdalam)
+    # Terapkan izin direktori setelah seluruh file diekstrak (dari path terdalam)
     dir_perms.sort(key=lambda x: len(x[0].parts), reverse=True)
     for dpath, dperm in dir_perms:
         if dperm:
@@ -456,11 +462,22 @@ def cmd_encrypt(path_str, local_only=False, force=False):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         temp_enc = tmp / f"{label}.enc"
+        unreadable_items = []
 
         if is_dir:
             log_info(f"Target adalah {C.MAGENTA}folder{C.RESET} -> Kompres ke ZIP...")
             zip_path = tmp / "data.zip"
-            compress_directory(target, zip_path)
+            unreadable_items, special_files = compress_directory(target, zip_path)
+
+            if special_files:
+                log_warn(f"{len(special_files)} file khusus (FIFO/socket/device) dilewati untuk mencegah hang.")
+            if unreadable_items:
+                log_warn(f"{len(unreadable_items)} file/direktori tidak dapat dibaca karena masalah izin:")
+                for upath, uerr in unreadable_items[:5]:
+                    print(f"    {C.GRAY}• {upath}: {uerr}{C.RESET}")
+                if len(unreadable_items) > 5:
+                    print(f"    {C.GRAY}...dan {len(unreadable_items) - 5} entri lainnya.{C.RESET}")
+
             with open(zip_path, "rb") as f:
                 raw_bytes = f.read()
         else:
@@ -491,6 +508,10 @@ def cmd_encrypt(path_str, local_only=False, force=False):
             log_success(f"File terenkripsi disimpan ke: {C.BOLD}{C.GREEN}{out_enc}{C.RESET}")
             log_success(f"Kunci tersimpan di vault lokal: {C.DIM}{DB_PATH}{C.RESET}")
             log_info(f"Untuk restore lokal: {C.GREEN}gde decrypt {out_enc.name}{C.RESET}")
+
+            if unreadable_items and not force:
+                log_warn(f"Selesai DENGAN PERINGATAN: Backup parsial ({len(unreadable_items)} entri dilewati).")
+                sys.exit(2)
             log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi lokal.")
             return
 
@@ -532,6 +553,10 @@ def cmd_encrypt(path_str, local_only=False, force=False):
         )
         conn.commit()
         log_success(f"Kunci & metadata aman tersimpan di {C.DIM}{DB_PATH}{C.RESET}")
+
+        if unreadable_items and not force:
+            log_warn(f"Selesai DENGAN PERINGATAN: Backup cloud parsial ({len(unreadable_items)} entri dilewati).")
+            sys.exit(2)
         log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi penuh di cloud.")
 
 
@@ -778,7 +803,7 @@ def cmd_export_keys(out_path=None):
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     fd = os.open(str(out_path), flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)  # Pastikan file lama yang ditimpa juga terkunci 0600
+        os.fchmod(fd, 0o600)
         with open(fd, "w", encoding="utf-8", closefd=False) as f:
             json.dump(data, f, indent=2)
     finally:
@@ -820,7 +845,7 @@ def cmd_import_keys(in_path):
 
 
 def self_test():
-    """Deterministic verification for single file, directory, and tamper detection."""
+    """Deterministic verification for single file, directory, symlinks, and tamper detection."""
     log_info("Menjalankan self-test GDE...")
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -842,7 +867,7 @@ def self_test():
         if dec_file != test_content:
             raise RuntimeError("Decrypted content mismatch on single file")
 
-        # 2. Test Directory with empty dirs, symlinks, and read-only folder
+        # 2. Test Directory with empty dirs, relative symlinks, absolute symlinks, and read-only folder
         folder_path = tmp / "my_folder"
         folder_path.mkdir()
         empty_sub = folder_path / "empty_sub"
@@ -859,14 +884,17 @@ def self_test():
         script_file.write_text("#!/bin/sh\necho test\n")
         script_file.chmod(0o755)
 
-        # Symlinks (valid & broken)
+        # Symlinks (relative, absolute harmless, absolute broken)
         os.symlink("script.sh", str(folder_path / "script_symlink"))
-        os.symlink("non_existent_target.txt", str(folder_path / "broken_symlink"))
+        os.symlink("/usr/bin/sh", str(folder_path / "abs_symlink"))
+        os.symlink("/non_existent/target/path", str(folder_path / "broken_abs_symlink"))
 
         zip_p = tmp / "folder.zip"
-        compress_directory(folder_path, zip_p)
+        unreadable, special_files = compress_directory(folder_path, zip_p)
         if not zip_p.exists():
             raise RuntimeError("Folder zip compression failed")
+        if unreadable:
+            raise RuntimeError(f"Unexpected unreadable files in self_test: {unreadable}")
 
         label_dir = "gde_testdir02"
         enc_dir, key_dir = encrypt_data(zip_p.read_bytes(), label_dir)
@@ -892,10 +920,16 @@ def self_test():
         restored_mode = stat.S_IMODE(restored_script.stat().st_mode)
         if restored_mode != 0o755:
             raise RuntimeError(f"Permissions not preserved: expected 0o755, got {oct(restored_mode)}")
+
+        # Verifikasi symlinks (relatif dan absolut)
         if not os.path.islink(str(restore_dir / "script_symlink")):
-            raise RuntimeError("Symlink not preserved")
-        if not os.path.islink(str(restore_dir / "broken_symlink")):
-            raise RuntimeError("Broken symlink not preserved")
+            raise RuntimeError("Relative symlink not preserved")
+        if not os.path.islink(str(restore_dir / "abs_symlink")):
+            raise RuntimeError("Absolute symlink not preserved")
+        if os.readlink(str(restore_dir / "abs_symlink")) != "/usr/bin/sh":
+            raise RuntimeError("Absolute symlink target mismatch")
+        if not os.path.islink(str(restore_dir / "broken_abs_symlink")):
+            raise RuntimeError("Broken absolute symlink not preserved")
 
         # Kembalikan permission ro_dir agar TemporaryDirectory bisa menghapusnya
         os.chmod(str(ro_dir), 0o755)
@@ -942,13 +976,25 @@ def self_test():
         if mode != 0o600:
             raise RuntimeError(f"Atomic file creation mode mismatch: {oct(mode)}")
 
-        # 7. Zip Slip attempt rejection test
+        # 7. Zip Slip attempt rejection test (writing through escape symlink)
+        outside_trap = tmp / "outside_trap"
+        outside_trap.mkdir()
+        (outside_trap / "victim.txt").write_text("clean")
+
         slip_zip_p = tmp / "slip.zip"
         with zipfile.ZipFile(slip_zip_p, "w") as zf:
+            z_esc = zipfile.ZipInfo("escape_link")
+            z_esc.create_system = 3
+            z_esc.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(z_esc, str(outside_trap))
+            zf.writestr("escape_link/victim.txt", "hacked")
             zf.writestr("../../evil.txt", "evil")
             zf.writestr("safe.txt", "safe")
+
         slip_target = tmp / "slip_target"
         extract_zip_faithful(slip_zip_p, slip_target)
+        if (outside_trap / "victim.txt").read_text() != "clean":
+            raise RuntimeError("Zip Slip vulnerability: Victim outside dest was overwritten through symlink!")
         if (tmp / "evil.txt").exists():
             raise RuntimeError("Zip Slip vulnerability detected! Path traversal succeeded.")
         if not (slip_target / "safe.txt").is_file():
@@ -956,12 +1002,13 @@ def self_test():
 
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} Folder (empty dirs, symlinks, 0555 readonly & 0755 exec): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Folder (empty dirs, 0555 readonly & 0755 exec): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Symlinks (relative, absolute, broken): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} ChaCha20-Poly1305 Ciphertext Tamper check (InvalidTag): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} AAD Label Tamper check: {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Wrong Key Rejection (InvalidTag): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Atomic 0o600 File & Overwrite Permissions: {C.GREEN}OK{C.RESET}")
-    print(f"    {C.GREEN}•{C.RESET} Zip Slip Defense (Path Traversal Rejection): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Zip Slip Defense (write-through-symlink & traversal blocked): {C.GREEN}OK{C.RESET}")
 
 
 def main():
@@ -987,7 +1034,7 @@ def main():
         print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}  Export cadangan kunci vault ke file JSON (chmod 600)")
         print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}  Import kunci vault dari file JSON")
         print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                Jalankan internal verification self-test")
-        print(f"  {C.GRAY}Opsi global: --force / -f (lewati konfirmasi penimpaan file){C.RESET}\n")
+        print(f"  {C.GRAY}Opsi global: --force / -f (lewati konfirmasi penimpaan file & abaikan unreadable){C.RESET}\n")
         sys.exit(0)
 
     cmd = args[0]
