@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/cipher-ChaCha20--Poly1305-emerald.svg" alt="Cipher">
   <img src="https://img.shields.io/badge/protocol-MCP%20JSON--RPC-cyan.svg" alt="MCP">
   <img src="https://img.shields.io/badge/vault-SQLite%20Local-yellow.svg" alt="Vault">
