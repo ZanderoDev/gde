@@ -53,7 +53,8 @@ Prinsipnya **zero-knowledge**: Google cuma nerima blob ciphertext acak (`gde_<la
 - **Vault Lokal & Backup Kunci**: SQLite lokal disimpan dengan permission ketat (`chmod 600`). Dilengkapi perintah `export-keys` dan `import-keys` untuk backup/migrasi kunci.
 - **Deteksi Akses & Peringatan**: File/folder yang tidak dapat dibaca (`PermissionError`) atau file khusus (FIFO/device) dideteksi dan dilaporkan eksplisit (exit code 2 untuk backup parsial kecuali `--force`).
 - **Tampilan CLI Rapi**: Output tabel berwarna dengan opsi download interaktif.
-- **Native MCP Integration**: Komunikasi langsung ke server Google Drive MCP lewat stdio JSON-RPC (resilient terhadap log stdout).
+- **Server MCP Bawaan untuk AI Agent**: Mendukung protokol Model Context Protocol (`2024-11-05`) lewat stdio JSON-RPC. AI Agent (Claude Desktop, Cursor, Antigravity, Cline) bisa langsung mengelola enkripsi, dekripsi, dan sinkronisasi vault.
+- **Native MCP Integration**: Komunikasi langsung ke runner Google Drive MCP lewat stdio JSON-RPC (aman dari polusi log stdout).
 
 ---
 
@@ -258,6 +259,50 @@ gde set-lang id
 # Override bahasa per-perintah
 gde --lang en list
 ```
+
+### Integrasi AI Agent via MCP (Model Context Protocol)
+
+GDE punya server MCP bawaan berstandar JSON-RPC 2.0 via stdio (`gde mcp`). Ini memungkinkan asisten AI atau coding agent (Claude Desktop, Cursor, Antigravity, Cline, Windsurf) mengakses enkripsi, dekripsi, dan sinkronisasi Google Drive langsung sebagai **native tools**.
+
+#### 1. Konfigurasi Claude Desktop (`claude_desktop_config.json`)
+Tambahkan blok ini ke file konfigurasi Claude Desktop kamu (`~/.config/Claude/claude_desktop_config.json` di Linux atau `~/Library/Application Support/Claude/claude_desktop_config.json` di macOS):
+
+```json
+{
+  "mcpServers": {
+    "gde": {
+      "command": "gde",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+> Bila binary `gde` berada di path khusus, tulis path lengkapnya, misalnya `"/home/username/.local/bin/gde"`.
+
+#### 2. Konfigurasi Cursor / Generic MCP Client
+Pada menu Settings > Features > MCP Servers di Cursor, buat konfigurasi baru:
+- **Type**: `command`
+- **Command**: `gde mcp`
+
+#### 3. Daftar Tools yang Tersedia untuk AI Agent
+
+| Nama Tool | Deskripsi | Argumen Utama |
+|---|---|---|
+| `gde_encrypt` | Enkripsi file/folder ke format ChaCha20-Poly1305. Bisa di-upload ke GDrive atau disimpan lokal. | `path` (string, wajib), `local_only` (bool), `allow_partial` (bool) |
+| `gde_decrypt` | Dekripsi file `.enc` lokal menggunakan kunci dari vault SQLite. | `enc_path` (string, wajib), `dest_dir` (string), `force` (bool), `key_hex` (string) |
+| `gde_list` | Ambil daftar seluruh file dan folder terenkripsi yang ada di vault. | *(tanpa argumen)* |
+| `gde_download` | Unduh file terenkripsi dari Google Drive (atau cari di lokal) lalu langsung pulihkan ke disk. | `item_id_or_label` (string, wajib), `dest_dir` (string), `force` (bool) |
+| `gde_status` | Cek status server GDE: direktori vault, jumlah entri, dan konektivitas token Google Drive. | *(tanpa argumen)* |
+| `gde_export_keys` | Ekspor seluruh kunci vault ke file backup JSON (dibuat dengan permission ketat `0600`). | `out_path` (string, opsional) |
+| `gde_import_keys` | Impor kunci vault dari file backup JSON dengan validasi sanitasi path. | `in_path` (string, wajib) |
+
+Contoh prompt ke AI Agent:
+- *"Tolong amankan folder proyek ini pakai tool gde_encrypt dengan opsi local_only."*
+- *"Cek apakah ada file backup terbaru di vault dengan gde_list."*
+- *"Dekripsi file laporan.pdf.enc ke folder ./restored."*
+
+---
 
 ### Opsi Tambahan
 

@@ -1442,6 +1442,737 @@ def cmd_set_lang(lang_code):
     log_done(t("lang_changed"))
 
 
+class GdeMCPServer:
+    """
+    Model Context Protocol (MCP) server for GDE.
+    Provides stdio JSON-RPC interface exposing encryption, decryption,
+    vault querying, and key management tools to AI Agents.
+    """
+
+    PROTOCOL_VERSION = "2024-11-05"
+    SERVER_INFO = {
+        "name": "gde-mcp-server",
+        "version": "1.5.0"
+    }
+
+    TOOLS = [
+        {
+            "name": "gde_encrypt",
+            "description": "Encrypt a file or folder using ChaCha20-Poly1305. Uploads to Google Drive or saves locally as .enc.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the file or directory to encrypt"
+                    },
+                    "local_only": {
+                        "type": "boolean",
+                        "description": "If true, saves encrypted file locally instead of uploading to Google Drive",
+                        "default": False
+                    },
+                    "allow_partial": {
+                        "type": "boolean",
+                        "description": "If true, skips unreadable files without raising an error",
+                        "default": False
+                    }
+                },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "gde_decrypt",
+            "description": "Decrypt a local .enc file using the key from local vault.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enc_path": {
+                        "type": "string",
+                        "description": "Path to the .enc file"
+                    },
+                    "dest_dir": {
+                        "type": "string",
+                        "description": "Destination directory for decrypted output (defaults to current dir)",
+                        "default": "."
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Overwrite existing destination file or directory",
+                        "default": True
+                    },
+                    "key_hex": {
+                        "type": "string",
+                        "description": "Optional 64-character hex key if not stored in local vault"
+                    }
+                },
+                "required": ["enc_path"]
+            }
+        },
+        {
+            "name": "gde_list",
+            "description": "List all encrypted files and folders stored in the local GDE vault.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "gde_download",
+            "description": "Download an encrypted file from Google Drive (or locate locally) and decrypt it to disk.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "item_id_or_label": {
+                        "type": "string",
+                        "description": "Vault ID (e.g. '1'), label (e.g. 'gde_abcd1234ef567890'), or original file name"
+                    },
+                    "dest_dir": {
+                        "type": "string",
+                        "description": "Directory where decrypted file/folder will be restored",
+                        "default": "."
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Overwrite existing restored target if it already exists",
+                        "default": True
+                    }
+                },
+                "required": ["item_id_or_label"]
+            }
+        },
+        {
+            "name": "gde_status",
+            "description": "Check GDE status: vault database path, item count, GCP OAuth credentials, and configured language.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "gde_export_keys",
+            "description": "Export all local vault encryption keys to a JSON file (permission 0600).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "out_path": {
+                        "type": "string",
+                        "description": "Target JSON file path for exported keys backup"
+                    }
+                }
+            }
+        },
+        {
+            "name": "gde_import_keys",
+            "description": "Import encryption keys from a backup JSON file into local vault.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "in_path": {
+                        "type": "string",
+                        "description": "Path to the backup JSON file"
+                    }
+                },
+                "required": ["in_path"]
+            }
+        }
+    ]
+
+    def handle_request(self, req: dict, conn_override=None) -> dict | None:
+        """Process a single JSON-RPC 2.0 message."""
+        method = req.get("method")
+        msg_id = req.get("id")
+
+        if msg_id is None:
+            # Notifications (no id) require no response
+            return None
+
+        if method == "initialize":
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "protocolVersion": self.PROTOCOL_VERSION,
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": self.SERVER_INFO
+                }
+            }
+
+        elif method == "ping":
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {}
+            }
+
+        elif method == "tools/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "tools": self.TOOLS
+                }
+            }
+
+        elif method == "tools/call":
+            params = req.get("params", {})
+            name = params.get("name")
+            args = params.get("arguments", {})
+            try:
+                res_data = self._dispatch_tool(name, args, conn_override=conn_override)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(res_data, indent=2) if isinstance(res_data, (dict, list)) else str(res_data)
+                            }
+                        ],
+                        "isError": False
+                    }
+                }
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Tool error ({name}): {e}"
+                            }
+                        ],
+                        "isError": True
+                    }
+                }
+
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32601,
+                    "message": f"Method not found: {method}"
+                }
+            }
+
+    def _dispatch_tool(self, name: str, args: dict, conn_override=None):
+        if name == "gde_encrypt":
+            path = args.get("path")
+            if not path:
+                raise ValueError("Argument 'path' is required.")
+            local_only = bool(args.get("local_only", False))
+            allow_partial = bool(args.get("allow_partial", False))
+            return self._tool_encrypt(path, local_only=local_only, allow_partial=allow_partial, conn_override=conn_override)
+
+        elif name == "gde_decrypt":
+            enc_path = args.get("enc_path")
+            if not enc_path:
+                raise ValueError("Argument 'enc_path' is required.")
+            dest_dir = args.get("dest_dir", ".")
+            force = bool(args.get("force", True))
+            key_hex = args.get("key_hex")
+            return self._tool_decrypt(enc_path, dest_dir=dest_dir, force=force, key_hex=key_hex, conn_override=conn_override)
+
+        elif name == "gde_list":
+            return self._tool_list(conn_override=conn_override)
+
+        elif name == "gde_download":
+            item = args.get("item_id_or_label")
+            if not item:
+                raise ValueError("Argument 'item_id_or_label' is required.")
+            dest_dir = args.get("dest_dir", ".")
+            force = bool(args.get("force", True))
+            return self._tool_download(item, dest_dir=dest_dir, force=force, conn_override=conn_override)
+
+        elif name == "gde_status":
+            return self._tool_status(conn_override=conn_override)
+
+        elif name == "gde_export_keys":
+            out_path = args.get("out_path")
+            return self._tool_export_keys(out_path=out_path, conn_override=conn_override)
+
+        elif name == "gde_import_keys":
+            in_path = args.get("in_path")
+            if not in_path:
+                raise ValueError("Argument 'in_path' is required.")
+            return self._tool_import_keys(in_path, conn_override=conn_override)
+
+        else:
+            raise ValueError(f"Unknown tool name: {name}")
+
+    def _tool_encrypt(self, path_str: str, local_only: bool = False, allow_partial: bool = False, conn_override=None):
+        target = Path(path_str).expanduser().resolve()
+        if not target.exists() and not os.path.islink(target):
+            raise FileNotFoundError(f"Path '{target}' not found.")
+
+        st = os.lstat(target)
+        if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
+            raise ValueError(f"Special file '{target.name}' is not supported.")
+
+        is_dir = 1 if stat.S_ISDIR(st.st_mode) and not os.path.islink(target) else 0
+        if not is_dir and not stat.S_ISREG(st.st_mode) and not os.path.islink(target):
+            raise ValueError(f"Target '{target.name}' is not a regular file or directory.")
+
+        conn = conn_override or init_db()
+        label = f"gde_{secrets.token_hex(8)}"
+
+        if is_dir:
+            size_bytes = sum(f.stat().st_size for f in target.glob("**/*") if f.is_file() and not os.path.islink(f))
+        else:
+            size_bytes = target.stat().st_size if not os.path.islink(target) else 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            temp_enc = tmp / f"{label}.enc"
+            unreadable_items = []
+            special_files = []
+
+            if is_dir:
+                zip_path = tmp / "data.zip"
+                unreadable_items, special_files = compress_directory(target, zip_path)
+                with open(zip_path, "rb") as f:
+                    raw_bytes = f.read()
+            else:
+                with open(target, "rb") as f:
+                    raw_bytes = f.read()
+
+            enc_bytes, key = encrypt_data(raw_bytes, label)
+            with open(temp_enc, "wb") as f:
+                f.write(enc_bytes)
+
+            created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if local_only:
+                out_enc = Path.cwd() / f"{target.name}.enc"
+                conn.execute(
+                    """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (label, target.name, str(target), is_dir, size_bytes, key.hex(), None, created_at)
+                )
+                conn.commit()
+
+                try:
+                    atomic_copy_file(temp_enc, out_enc, mode=0o644)
+                except Exception as e:
+                    conn.execute("DELETE FROM vault WHERE label = ?", (label,))
+                    conn.commit()
+                    raise RuntimeError(f"Failed to write encrypted file to {out_enc}: {e}")
+
+                return {
+                    "status": "success",
+                    "mode": "local",
+                    "label": label,
+                    "original_name": target.name,
+                    "original_path": str(target),
+                    "is_dir": bool(is_dir),
+                    "size_bytes": size_bytes,
+                    "output_file": str(out_enc),
+                    "unreadable_skipped": len(unreadable_items),
+                    "special_skipped": len(special_files)
+                }
+
+            # Cloud mode
+            conn.execute(
+                """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (label, target.name, str(target), is_dir, size_bytes, key.hex(), None, created_at)
+            )
+            conn.commit()
+
+            mcp = GDriveMCP()
+            drive_file_id = None
+            try:
+                mcp.start()
+                drive_file_id = mcp.upload_file(temp_enc, f"{label}.enc")
+                conn.execute("UPDATE vault SET drive_file_id = ? WHERE label = ?", (drive_file_id, label))
+                conn.commit()
+            finally:
+                mcp.close()
+
+            return {
+                "status": "success",
+                "mode": "cloud",
+                "label": label,
+                "original_name": target.name,
+                "original_path": str(target),
+                "is_dir": bool(is_dir),
+                "size_bytes": size_bytes,
+                "drive_file_id": drive_file_id,
+                "unreadable_skipped": len(unreadable_items),
+                "special_skipped": len(special_files)
+            }
+
+    def _tool_decrypt(self, enc_path_str: str, dest_dir: str = ".", force: bool = True, key_hex: str = None, conn_override=None):
+        enc_path = Path(enc_path_str).expanduser().resolve()
+        if not enc_path.exists():
+            raise FileNotFoundError(f"Encrypted file '{enc_path}' not found.")
+
+        with open(enc_path, "rb") as f:
+            enc_data = f.read()
+
+        if len(enc_data) < 5:
+            raise ValueError("File format invalid (too short).")
+
+        magic = enc_data[:4]
+        if magic not in (MAGIC_GDE, MAGIC_EGD):
+            raise ValueError("Not a valid GDE/EGD encrypted file.")
+
+        label_len = enc_data[4]
+        label = enc_data[5:5 + label_len].decode("utf-8", errors="ignore")
+
+        conn = conn_override or init_db()
+        cur = conn.cursor()
+        cur.execute("SELECT original_name, is_dir, enc_key FROM vault WHERE label = ?", (label,))
+        row = cur.fetchone()
+
+        if row:
+            name, is_dir, key_hex_db = row
+            key = bytes.fromhex(key_hex_db)
+        elif key_hex:
+            try:
+                key = bytes.fromhex(key_hex.strip())
+                if len(key) != 32:
+                    raise ValueError("Key must be 32 bytes (64 hex characters)")
+            except ValueError as ve:
+                raise ValueError(f"Invalid key_hex: {ve}")
+            name = enc_path.stem
+            is_dir = 0
+        else:
+            raise ValueError(f"Key for label '{label}' not found in vault. Provide 'key_hex' parameter.")
+
+        dec_bytes, extracted_label = decrypt_data(enc_data, key)
+        if extracted_label != label:
+            raise ValueError("Label mismatch tag")
+
+        safe_name = Path(name).name
+        if not safe_name or safe_name in (".", ".."):
+            safe_name = f"{label}.restored"
+
+        base_dest_dir = Path(dest_dir).resolve()
+        dest = base_dest_dir / safe_name
+        if not is_subpath(dest.parent, base_dest_dir):
+            raise ValueError(f"Path traversal detected: {dest}")
+
+        if (dest.exists() or os.path.islink(dest)) and not force:
+            raise FileExistsError(f"Destination '{dest}' already exists and force=False.")
+
+        if os.path.islink(dest):
+            dest.unlink()
+
+        if is_dir:
+            dest.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_zip = Path(tmpdir) / "restored.zip"
+                tmp_zip.write_bytes(dec_bytes)
+                extract_zip_faithful(tmp_zip, dest)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = dest.parent / f".tmp_{secrets.token_hex(6)}"
+            fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with open(fd, "wb", closefd=False) as fp:
+                    fp.write(dec_bytes)
+                    fp.flush()
+                    os.fsync(fd)
+                os.replace(tmp_file, dest)
+            finally:
+                os.close(fd)
+                if tmp_file.exists():
+                    try:
+                        tmp_file.unlink()
+                    except OSError:
+                        pass
+
+        return {
+            "status": "success",
+            "label": label,
+            "original_name": safe_name,
+            "restored_path": str(dest),
+            "is_dir": bool(is_dir)
+        }
+
+    def _tool_list(self, conn_override=None):
+        conn = conn_override or init_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id, label, original_name, original_path, is_dir, size_bytes, drive_file_id, created_at FROM vault ORDER BY id DESC")
+        rows = cur.fetchall()
+        items = []
+        for r in rows:
+            items.append({
+                "id": r[0],
+                "label": r[1],
+                "original_name": r[2],
+                "original_path": r[3],
+                "is_dir": bool(r[4]),
+                "size_bytes": r[5],
+                "drive_file_id": r[6],
+                "created_at": r[7]
+            })
+        return {"total": len(items), "items": items}
+
+    def _tool_download(self, item_id_or_label, dest_dir=".", force=True, conn_override=None):
+        conn = conn_override or init_db()
+        cur = conn.cursor()
+        if isinstance(item_id_or_label, int) or str(item_id_or_label).isdigit():
+            cur.execute("SELECT id, label, original_name, original_path, is_dir, enc_key, drive_file_id FROM vault WHERE id = ?", (int(item_id_or_label),))
+        else:
+            cur.execute("SELECT id, label, original_name, original_path, is_dir, enc_key, drive_file_id FROM vault WHERE label = ? OR original_name = ?", (str(item_id_or_label), str(item_id_or_label)))
+
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Item '{item_id_or_label}' not found in vault.")
+
+        item_id, label, name, original_path, is_dir, key_hex, drive_file_id = row
+        key = bytes.fromhex(key_hex)
+
+        safe_name = Path(name).name
+        if not safe_name or safe_name in (".", ".."):
+            safe_name = f"{label}.restored"
+
+        base_dest_dir = Path(dest_dir).resolve()
+        dest = base_dest_dir / safe_name
+        if not is_subpath(dest.parent, base_dest_dir):
+            raise ValueError(f"Path traversal detected: {dest}")
+
+        if (dest.exists() or os.path.islink(dest)) and not force:
+            raise FileExistsError(f"Destination '{dest}' already exists and force=False.")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            enc_file = tmp / f"{label}.enc"
+
+            if not drive_file_id:
+                candidates = [
+                    Path.cwd() / f"{safe_name}.enc",
+                    Path.cwd() / f"{label}.enc",
+                    Path(original_path).parent / f"{safe_name}.enc"
+                ]
+                found = None
+                for cand in candidates:
+                    if cand.exists():
+                        found = cand
+                        break
+                if found:
+                    enc_file = found
+                else:
+                    raise FileNotFoundError(f"Local ciphertext '{safe_name}.enc' not found.")
+            else:
+                mcp = GDriveMCP()
+                try:
+                    mcp.start()
+                    mcp.download_file(drive_file_id, enc_file)
+                finally:
+                    mcp.close()
+
+            if not enc_file.exists():
+                raise FileNotFoundError("Downloaded file was not created.")
+
+            with open(enc_file, "rb") as f:
+                enc_data = f.read()
+
+            dec_bytes, extracted_label = decrypt_data(enc_data, key)
+            if extracted_label != label:
+                raise ValueError("Mismatch label tag")
+
+            if os.path.islink(dest):
+                dest.unlink()
+
+            if is_dir:
+                dest.mkdir(parents=True, exist_ok=True)
+                decrypted_zip = tmp / "restored.zip"
+                decrypted_zip.write_bytes(dec_bytes)
+                extract_zip_faithful(decrypted_zip, dest)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                tmp_file = dest.parent / f".tmp_{secrets.token_hex(6)}"
+                fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    with open(fd, "wb", closefd=False) as fp:
+                        fp.write(dec_bytes)
+                        fp.flush()
+                        os.fsync(fd)
+                    os.replace(tmp_file, dest)
+                finally:
+                    os.close(fd)
+                    if tmp_file.exists():
+                        try:
+                            tmp_file.unlink()
+                        except OSError:
+                            pass
+
+        return {
+            "status": "success",
+            "id": item_id,
+            "label": label,
+            "original_name": safe_name,
+            "restored_path": str(dest),
+            "is_dir": bool(is_dir)
+        }
+
+    def _tool_status(self, conn_override=None):
+        conn = conn_override or init_db()
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM vault")
+        total_items = cur.fetchone()[0]
+        mcp_cfg = Path.home() / ".config" / "google-drive-mcp"
+        gcp_keys = (mcp_cfg / "gcp-oauth.keys.json").exists()
+        tokens = (mcp_cfg / "tokens.json").exists()
+        return {
+            "server": "GDE MCP Server",
+            "version": "1.5.0",
+            "vault_path": str(DB_PATH),
+            "vault_entries": total_items,
+            "language": CURRENT_LANG,
+            "gdrive_oauth_keys_present": gcp_keys,
+            "gdrive_token_active": tokens
+        }
+
+    def _tool_export_keys(self, out_path=None, conn_override=None):
+        conn = conn_override or init_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id, label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at FROM vault")
+        rows = cur.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "id": r[0],
+                "label": r[1],
+                "original_name": r[2],
+                "original_path": r[3],
+                "is_dir": r[4],
+                "size_bytes": r[5],
+                "enc_key": r[6],
+                "drive_file_id": r[7],
+                "created_at": r[8]
+            })
+
+        if not out_path:
+            target_path = Path.home() / ".config" / "gde" / f"vault-backup-{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+        else:
+            raw_path = Path(out_path).expanduser()
+            parent_dir = raw_path.parent.resolve()
+            target_path = parent_dir / raw_path.name
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.islink(target_path):
+            target_path.unlink()
+
+        tmp_path = target_path.parent / f".tmp_export_{secrets.token_hex(6)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(str(tmp_path), flags, 0o600)
+        try:
+            with open(fd, "w", encoding="utf-8", closefd=False) as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(fd)
+            os.replace(tmp_path, target_path)
+        finally:
+            os.close(fd)
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        return {
+            "status": "success",
+            "export_path": str(target_path),
+            "entries_count": len(data)
+        }
+
+    def _tool_import_keys(self, in_path: str, conn_override=None):
+        path = Path(in_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Backup file '{path}' not found.")
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            raise ValueError("Invalid JSON backup format: Root must be an array.")
+
+        conn = conn_override or init_db()
+        count = 0
+        rejected = 0
+
+        for item in data:
+            if not isinstance(item, dict):
+                rejected += 1
+                continue
+
+            label = str(item.get("label", "")).strip()
+            if not re.match(r"^[a-zA-Z0-9_]{4,64}$", label):
+                rejected += 1
+                continue
+
+            enc_key = str(item.get("enc_key", "")).strip()
+            if not re.match(r"^[0-9a-fA-F]{64}$", enc_key):
+                rejected += 1
+                continue
+
+            raw_name = str(item.get("original_name", "")).strip()
+            safe_name = Path(raw_name).name
+            if not safe_name or safe_name in (".", "..") or "/" in raw_name or "\\" in raw_name:
+                safe_name = safe_name or f"{label}.restored"
+
+            is_dir = 1 if item.get("is_dir") else 0
+            size_bytes = int(item.get("size_bytes", 0)) if str(item.get("size_bytes", 0)).isdigit() else 0
+            drive_file_id = str(item.get("drive_file_id")).strip() if item.get("drive_file_id") else None
+            created_at = str(item.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM vault WHERE label = ?", (label,))
+            if not cur.fetchone():
+                conn.execute(
+                    """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (label, safe_name, safe_name, is_dir, size_bytes, enc_key, drive_file_id, created_at)
+                )
+                count += 1
+
+        conn.commit()
+        return {
+            "status": "success",
+            "imported_count": count,
+            "rejected_count": rejected
+        }
+
+    def serve_stdio(self, conn_override=None):
+        real_stdout = sys.stdout
+        sys.stdout = sys.stderr
+
+        try:
+            for line in iter(sys.stdin.readline, ""):
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    req = json.loads(line)
+                except Exception as e:
+                    err_resp = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": f"Parse error: {e}"}
+                    }
+                    real_stdout.write(json.dumps(err_resp) + "\n")
+                    real_stdout.flush()
+                    continue
+
+                resp = self.handle_request(req, conn_override=conn_override)
+                if resp is not None:
+                    real_stdout.write(json.dumps(resp) + "\n")
+                    real_stdout.flush()
+        finally:
+            sys.stdout = real_stdout
+
+
 def self_test():
     """Deterministic verification executing production functions for security and integrity."""
     log_info("Menjalankan self-test GDE...")
@@ -1725,6 +2456,124 @@ def self_test():
         if format_duration(86400, lang="en") != "1 day":
             raise RuntimeError("format_duration failed on 86400 (en)")
 
+        # 11. Model Context Protocol (MCP) Server Test
+        mcp_server = GdeMCPServer()
+
+        # 11a. MCP initialize
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0"}
+            }
+        }
+        init_res = mcp_server.handle_request(init_req, conn_override=test_conn)
+        if init_res.get("id") != 1 or init_res.get("result", {}).get("protocolVersion") != "2024-11-05":
+            raise RuntimeError(f"MCP initialize response mismatch: {init_res}")
+
+        # 11b. MCP ping
+        ping_res = mcp_server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "ping"}, conn_override=test_conn)
+        if ping_res.get("id") != 2 or "result" not in ping_res:
+            raise RuntimeError(f"MCP ping response mismatch: {ping_res}")
+
+        # 11c. MCP tools/list
+        tools_res = mcp_server.handle_request({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}, conn_override=test_conn)
+        tool_names = [t["name"] for t in tools_res.get("result", {}).get("tools", [])]
+        for expected_tool in ["gde_encrypt", "gde_decrypt", "gde_list", "gde_download", "gde_status", "gde_export_keys", "gde_import_keys"]:
+            if expected_tool not in tool_names:
+                raise RuntimeError(f"MCP tool '{expected_tool}' missing from tools/list")
+
+        # 11d. MCP tools/call gde_status
+        status_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "gde_status", "arguments": {}}
+        }, conn_override=test_conn)
+        if status_res.get("result", {}).get("isError"):
+            raise RuntimeError(f"MCP gde_status call failed: {status_res}")
+        status_body = json.loads(status_res["result"]["content"][0]["text"])
+        if "vault_entries" not in status_body:
+            raise RuntimeError(f"MCP status body missing vault_entries: {status_body}")
+
+        # 11e. MCP tools/call gde_encrypt (local_only) & gde_decrypt
+        mcp_test_file = tmp / "mcp_payload.txt"
+        mcp_test_payload = "Halo dari AI Agent via Model Context Protocol!"
+        mcp_test_file.write_text(mcp_test_payload, encoding="utf-8")
+
+        enc_tool_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "gde_encrypt",
+                "arguments": {
+                    "path": str(mcp_test_file),
+                    "local_only": True
+                }
+            }
+        }, conn_override=test_conn)
+        if enc_tool_res.get("result", {}).get("isError"):
+            raise RuntimeError(f"MCP gde_encrypt call failed: {enc_tool_res}")
+        enc_result = json.loads(enc_tool_res["result"]["content"][0]["text"])
+        enc_out_path = Path(enc_result["output_file"])
+        if not enc_out_path.exists():
+            raise RuntimeError(f"MCP output file not found on disk: {enc_out_path}")
+
+        mcp_restore_dir = tmp / "mcp_restored"
+        mcp_restore_dir.mkdir()
+        dec_tool_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "gde_decrypt",
+                "arguments": {
+                    "enc_path": str(enc_out_path),
+                    "dest_dir": str(mcp_restore_dir),
+                    "force": True
+                }
+            }
+        }, conn_override=test_conn)
+        if dec_tool_res.get("result", {}).get("isError"):
+            raise RuntimeError(f"MCP gde_decrypt call failed: {dec_tool_res}")
+        restored_mcp_file = mcp_restore_dir / "mcp_payload.txt"
+        if not restored_mcp_file.exists() or restored_mcp_file.read_text(encoding="utf-8") != mcp_test_payload:
+            raise RuntimeError("MCP decrypted file content mismatch")
+        enc_out_path.unlink()
+
+        # 11f. MCP tools/call gde_list
+        list_tool_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "gde_list", "arguments": {}}
+        }, conn_override=test_conn)
+        list_body = json.loads(list_tool_res["result"]["content"][0]["text"])
+        if not any(item["label"] == enc_result["label"] for item in list_body.get("items", [])):
+            raise RuntimeError("MCP gde_list missing recently encrypted item")
+
+        # 11g. MCP Error handling (method not found & unknown tool)
+        bad_method_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "invalid/method"
+        }, conn_override=test_conn)
+        if bad_method_res.get("error", {}).get("code") != -32601:
+            raise RuntimeError(f"MCP error code for unknown method mismatch: {bad_method_res}")
+
+        bad_tool_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "unknown_tool", "arguments": {}}
+        }, conn_override=test_conn)
+        if not bad_tool_res.get("result", {}).get("isError"):
+            raise RuntimeError(f"MCP unknown tool did not return isError=True: {bad_tool_res}")
+
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Folder (empty dirs, 0555 readonly & 0755 exec): {C.GREEN}OK{C.RESET}")
@@ -1740,6 +2589,7 @@ def self_test():
     print(f"    {C.GREEN}•{C.RESET} Hard Link Defense in ZIP Restore (victim preservation): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Scheduled Backup Duration Parser (s, m, h, d, y): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Bilingual Support & Humanizer-ID (ID/EN): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Model Context Protocol (MCP) Server (JSON-RPC stdio & tools): {C.GREEN}OK{C.RESET}")
 
 
 def main():
@@ -1827,6 +2677,7 @@ def main():
             print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}         Export vault keys backup to JSON file (chmod 600)")
             print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}         Import vault keys from backup JSON file")
             print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}           Set default interface language (ID / EN)")
+            print(f"  {C.GREEN}gde {C.CYAN}mcp{C.RESET}                        Start Model Context Protocol (MCP) server for AI Agents")
             print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                       Run internal verification self-test")
             print(f"  {C.GRAY}Options:{C.RESET}")
             print(f"    {C.YELLOW}--time / -t <duration>{C.RESET}      Schedule interval: s (sec), m (min), h (hours), d (days), y (years)")
@@ -1847,6 +2698,7 @@ def main():
             print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}         Export cadangan kunci vault ke file JSON (chmod 600)")
             print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}         Import kunci vault dari file backup JSON")
             print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}           Ubah bahasa tampilan default (ID / EN)")
+            print(f"  {C.GREEN}gde {C.CYAN}mcp{C.RESET}                        Jalankan server Model Context Protocol (MCP) untuk AI Agent")
             print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                       Jalankan internal verification self-test")
             print(f"  {C.GRAY}Opsi tambahan:{C.RESET}")
             print(f"    {C.YELLOW}--time / -t <durasi>{C.RESET}         Interval jadwal: s (detik), m (menit), h (jam), d (hari), y (tahun)")
@@ -1896,6 +2748,12 @@ def main():
             log_err("Berikan kode bahasa: 'id' atau 'en' / Provide language code: 'id' or 'en'")
             sys.exit(1)
         cmd_set_lang(args[1])
+    elif cmd in ("mcp", "serve"):
+        if time_interval is not None:
+            log_err("Flag '--time' tidak berlaku untuk mode MCP.")
+            sys.exit(1)
+        server = GdeMCPServer()
+        server.serve_stdio()
     elif cmd == "test":
         if time_interval is not None:
             log_err("Flag '--time' tidak berlaku untuk perintah 'test'.")
