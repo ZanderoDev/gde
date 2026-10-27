@@ -10,6 +10,10 @@
   <img src="https://img.shields.io/badge/vault-SQLite%20Local-yellow.svg" alt="Vault">
 </p>
 
+<p align="center">
+  <b>🇮🇩 Bahasa Indonesia</b> | <a href="README.en.md">🇬🇧 English</a>
+</p>
+
 # GDE (Google Drive Encryption)
 
 CLI tool buat mengenkripsi file atau folder secara lokal sebelum di-upload ke Google Drive lewat MCP (`@piotr-agier/google-drive-mcp`).
