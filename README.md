@@ -55,7 +55,7 @@ Prinsipnya **zero-knowledge**: Google cuma nerima blob ciphertext acak (`gde_<la
 - **Smart packing**: file tunggal langsung dienkripsi tanpa overhead ZIP. Folder di-zip secara rekursif dulu sebelum dienkripsi, dengan permission executable (`0755`), direktori read-only (`0555`), symlink (relatif dan absolut), dan subfolder kosong tetap dipertahankan. Ada juga proteksi Zip Slip.
 - **Anti-tampering**: label file terikat ke AAD (Additional Authenticated Data). Kalau isi file atau labelnya diubah, tag Poly1305 langsung menolak dekripsi.
 - **Vault lokal dan backup kunci**: SQLite lokal disimpan dengan permission ketat (`chmod 600`). Ada perintah `export-keys` dan `import-keys` buat backup atau migrasi kunci.
-- **Deteksi akses dan peringatan**: file atau folder yang nggak bisa dibaca (`PermissionError`) dan file khusus (FIFO/device) dideteksi lalu dilaporkan secara eksplisit. Backup parsial berakhir dengan exit code 2 kecuali kamu pakai `--force`.
+- **Deteksi akses dan peringatan**: file atau folder yang nggak bisa dibaca (`PermissionError`) dan file khusus (FIFO/device) dideteksi lalu dilaporkan secara eksplisit. Backup parsial berakhir dengan exit code 2 kecuali kamu pakai `--allow-partial`.
 - **Tampilan CLI rapi**: output tabel berwarna dengan opsi download interaktif.
 - **Server MCP bawaan buat AI agent**: mendukung Model Context Protocol (`2024-11-05`) lewat stdio JSON-RPC. AI agent (Claude Desktop, Cursor, Antigravity, Cline) bisa langsung ngatur enkripsi, dekripsi, dan sinkronisasi vault.
 - **Native MCP integration**: komunikasi langsung ke runner Google Drive MCP lewat stdio JSON-RPC, jadi aman dari polusi log stdout.

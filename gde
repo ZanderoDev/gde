@@ -5,6 +5,8 @@ Local encryption (ChaCha20-Poly1305) + local key vault + Google Drive MCP.
 Direct file encryption (no zip) for single files, faithful zip for directories.
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import json
@@ -22,6 +24,7 @@ import re
 import time
 from pathlib import Path
 from datetime import datetime
+from typing import Optional, List, Dict, Union, Any
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -29,6 +32,8 @@ try:
 except ImportError:
     print("Error: 'cryptography' library required. Run: pip install cryptography", file=sys.stderr)
     sys.exit(1)
+
+VERSION = "1.5.0"
 
 # ANSI Colors
 class C:
@@ -322,6 +327,40 @@ def is_subpath(child, parent):
         return False
 
 
+DANGEROUS_SYSTEM_PATHS = (
+    Path("/etc"),
+    Path("/proc"),
+    Path("/sys"),
+    Path("/dev"),
+    Path("/boot"),
+    Path("/root"),
+    Path("/var/log"),
+)
+
+
+def is_safe_mcp_path(path: Union[str, Path]) -> bool:
+    """Validate that path does not access dangerous system roots and conforms to optional whitelists."""
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except Exception:
+        return False
+
+    for dangerous in DANGEROUS_SYSTEM_PATHS:
+        try:
+            if resolved == dangerous or is_subpath(resolved, dangerous):
+                return False
+        except Exception:
+            return False
+
+    allowed_roots_env = os.environ.get("GDE_ALLOWED_ROOTS")
+    if allowed_roots_env:
+        allowed_roots = [Path(p.strip()).expanduser().resolve() for p in allowed_roots_env.split(":") if p.strip()]
+        if allowed_roots and not any(resolved == r or is_subpath(resolved, r) for r in allowed_roots):
+            return False
+
+    return True
+
+
 def atomic_copy_file(src_path, dest_path, mode=0o600):
     """Copy a file to dest_path atomically without overwriting existing hard links."""
     dest = Path(dest_path).resolve()
@@ -476,7 +515,7 @@ class GDriveMCP:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "gde-cli", "version": "1.4.2"}
+                    "clientInfo": {"name": "gde-cli", "version": VERSION}
                 }
             })
             if "error" in init_res:
@@ -781,7 +820,7 @@ def confirm_overwrite(dest_path, force=False):
     return ans in ("y", "yes")
 
 
-def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False, exit_on_error=True):
+def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False, exit_on_error=True, output_filename=None, conn_override=None):
     target = Path(path_str).expanduser().resolve()
     if not target.exists() and not os.path.islink(target):
         log_err(t("target_not_found", target=target))
@@ -811,7 +850,7 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False, ex
             sys.exit(1)
         return 1
 
-    conn = init_db()
+    conn = conn_override or init_db()
     label = f"gde_{secrets.token_hex(8)}"
 
     if is_dir:
@@ -859,12 +898,23 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False, ex
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if local_only:
-            out_enc = Path.cwd() / f"{target.name}.enc"
+            out_enc = Path.cwd() / (output_filename if output_filename else f"{target.name}.enc")
             if not confirm_overwrite(out_enc, force=force):
                 log_warn(t("cancelled_by_user"))
                 if exit_on_error:
                     sys.exit(1)
                 return 1
+
+            old_label = None
+            if out_enc.exists():
+                try:
+                    with open(out_enc, "rb") as old_fp:
+                        old_header = old_fp.read(64)
+                        if len(old_header) >= 5 and old_header[:4] in (MAGIC_GDE, MAGIC_EGD):
+                            l_len = old_header[4]
+                            old_label = old_header[5:5 + l_len].decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
 
             # Simpan kunci ke DB lokal TERLEBIH DAHULU sebelum menyalin file keluar
             conn.execute(
@@ -877,6 +927,9 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False, ex
             try:
                 # Bug #1: Salin secara atomik agar tidak menimpa inode hardlink yang ada
                 atomic_copy_file(temp_enc, out_enc, mode=0o644)
+                if old_label and old_label != label:
+                    conn.execute("DELETE FROM vault WHERE label = ? AND drive_file_id IS NULL", (old_label,))
+                    conn.commit()
             except Exception as e:
                 conn.execute("DELETE FROM vault WHERE label = ?", (label,))
                 conn.commit()
@@ -976,11 +1029,18 @@ def run_scheduled_backup(path_str, interval_seconds, local_only=False, force=Fal
     effective_force = True if force or not sys.stdin.isatty() else force
 
     while True:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_dt = datetime.now()
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         header_text = f"{t('sched_cycle_header', cycle=cycle)} — {now_str}"
-        print(f"\n{C.CYAN}╔═════════════════════════════════════════════════════════════╗{C.RESET}")
-        print(f"{C.CYAN}║  {C.BOLD}{header_text:<57}{C.RESET}{C.CYAN}║{C.RESET}")
-        print(f"{C.CYAN}╚═════════════════════════════════════════════════════════════╝{C.RESET}")
+        sched_border = "═" * (len(header_text) + 4)
+        print(f"\n{C.CYAN}╔{sched_border}╗{C.RESET}")
+        print(f"{C.CYAN}║  {C.BOLD}{header_text}{C.RESET}{C.CYAN}  ║{C.RESET}")
+        print(f"{C.CYAN}╚{sched_border}╝{C.RESET}")
+
+        custom_out = None
+        if local_only:
+            ts_compact = now_dt.strftime("%Y%m%d_%H%M%S")
+            custom_out = f"{target.name}.{ts_compact}.enc"
 
         try:
             ret = cmd_encrypt(
@@ -988,9 +1048,18 @@ def run_scheduled_backup(path_str, interval_seconds, local_only=False, force=Fal
                 local_only=local_only,
                 force=effective_force,
                 allow_partial=allow_partial,
-                exit_on_error=False
+                exit_on_error=False,
+                output_filename=custom_out
             )
             if ret == 0:
+                if local_only and custom_out:
+                    latest_link = Path.cwd() / f"{target.name}.enc"
+                    try:
+                        if latest_link.exists() or os.path.islink(latest_link):
+                            latest_link.unlink()
+                        os.symlink(custom_out, str(latest_link))
+                    except Exception:
+                        pass
                 log_success(t("sched_cycle_success", cycle=cycle))
             elif ret == 2:
                 log_warn(t("sched_cycle_warn", cycle=cycle))
@@ -1452,7 +1521,7 @@ class GdeMCPServer:
     PROTOCOL_VERSION = "2024-11-05"
     SERVER_INFO = {
         "name": "gde-mcp-server",
-        "version": "1.5.0"
+        "version": VERSION
     }
 
     TOOLS = [
@@ -1469,6 +1538,11 @@ class GdeMCPServer:
                     "local_only": {
                         "type": "boolean",
                         "description": "If true, saves encrypted file locally instead of uploading to Google Drive",
+                        "default": False
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "If true and local_only, allows overwriting existing .enc file instead of generating a unique name",
                         "default": False
                     },
                     "allow_partial": {
@@ -1497,8 +1571,8 @@ class GdeMCPServer:
                     },
                     "force": {
                         "type": "boolean",
-                        "description": "Overwrite existing destination file or directory",
-                        "default": True
+                        "description": "Overwrite existing destination file or directory (default False for safety)",
+                        "default": False
                     },
                     "key_hex": {
                         "type": "string",
@@ -1533,8 +1607,8 @@ class GdeMCPServer:
                     },
                     "force": {
                         "type": "boolean",
-                        "description": "Overwrite existing restored target if it already exists",
-                        "default": True
+                        "description": "Overwrite existing restored target if it already exists (default False for safety)",
+                        "default": False
                     }
                 },
                 "required": ["item_id_or_label"]
@@ -1542,7 +1616,7 @@ class GdeMCPServer:
         },
         {
             "name": "gde_status",
-            "description": "Check GDE status: vault database path, item count, GCP OAuth credentials, and configured language.",
+            "description": "Check GDE status: vault database path, item count, GCP OAuth credentials, read-only mode, and configured language.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -1550,7 +1624,7 @@ class GdeMCPServer:
         },
         {
             "name": "gde_export_keys",
-            "description": "Export all local vault encryption keys to a JSON file (permission 0600).",
+            "description": "Export all local vault encryption keys to a JSON file (permission 0600). Restricted to safe paths.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1577,7 +1651,10 @@ class GdeMCPServer:
         }
     ]
 
-    def handle_request(self, req: dict, conn_override=None) -> dict | None:
+    def __init__(self, readonly: bool = False):
+        self.readonly = readonly or (os.environ.get("GDE_MCP_READONLY", "0").lower() in ("1", "true", "yes"))
+
+    def handle_request(self, req: dict, conn_override=None) -> Optional[Dict[str, Any]]:
         """Process a single JSON-RPC 2.0 message."""
         method = req.get("method")
         msg_id = req.get("id")
@@ -1660,20 +1737,24 @@ class GdeMCPServer:
             }
 
     def _dispatch_tool(self, name: str, args: dict, conn_override=None):
+        if self.readonly and name in ("gde_encrypt", "gde_decrypt", "gde_download", "gde_import_keys"):
+            raise PermissionError(f"GDE MCP Server is running in read-only mode. Mutation tool '{name}' is blocked.")
+
         if name == "gde_encrypt":
             path = args.get("path")
             if not path:
                 raise ValueError("Argument 'path' is required.")
             local_only = bool(args.get("local_only", False))
             allow_partial = bool(args.get("allow_partial", False))
-            return self._tool_encrypt(path, local_only=local_only, allow_partial=allow_partial, conn_override=conn_override)
+            force = bool(args.get("force", False))
+            return self._tool_encrypt(path, local_only=local_only, allow_partial=allow_partial, force=force, conn_override=conn_override)
 
         elif name == "gde_decrypt":
             enc_path = args.get("enc_path")
             if not enc_path:
                 raise ValueError("Argument 'enc_path' is required.")
             dest_dir = args.get("dest_dir", ".")
-            force = bool(args.get("force", True))
+            force = bool(args.get("force", False))
             key_hex = args.get("key_hex")
             return self._tool_decrypt(enc_path, dest_dir=dest_dir, force=force, key_hex=key_hex, conn_override=conn_override)
 
@@ -1685,13 +1766,15 @@ class GdeMCPServer:
             if not item:
                 raise ValueError("Argument 'item_id_or_label' is required.")
             dest_dir = args.get("dest_dir", ".")
-            force = bool(args.get("force", True))
+            force = bool(args.get("force", False))
             return self._tool_download(item, dest_dir=dest_dir, force=force, conn_override=conn_override)
 
         elif name == "gde_status":
             return self._tool_status(conn_override=conn_override)
 
         elif name == "gde_export_keys":
+            if os.environ.get("GDE_MCP_ALLOW_EXPORT", "1").lower() in ("0", "false", "no"):
+                raise PermissionError("Key export via MCP is disabled by configuration (GDE_MCP_ALLOW_EXPORT=0).")
             out_path = args.get("out_path")
             return self._tool_export_keys(out_path=out_path, conn_override=conn_override)
 
@@ -1704,10 +1787,13 @@ class GdeMCPServer:
         else:
             raise ValueError(f"Unknown tool name: {name}")
 
-    def _tool_encrypt(self, path_str: str, local_only: bool = False, allow_partial: bool = False, conn_override=None):
+    def _tool_encrypt(self, path_str: str, local_only: bool = False, allow_partial: bool = False, force: bool = False, conn_override=None):
         target = Path(path_str).expanduser().resolve()
         if not target.exists() and not os.path.islink(target):
             raise FileNotFoundError(f"Path '{target}' not found.")
+
+        if not is_safe_mcp_path(target):
+            raise PermissionError(f"Access to path '{target}' is restricted for MCP security.")
 
         st = os.lstat(target)
         if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
@@ -1748,6 +1834,20 @@ class GdeMCPServer:
 
             if local_only:
                 out_enc = Path.cwd() / f"{target.name}.enc"
+                if out_enc.exists() and not force:
+                    out_enc = Path.cwd() / f"{target.name}.{secrets.token_hex(4)}.enc"
+
+                old_label = None
+                if out_enc.exists():
+                    try:
+                        with open(out_enc, "rb") as old_fp:
+                            old_header = old_fp.read(64)
+                            if len(old_header) >= 5 and old_header[:4] in (MAGIC_GDE, MAGIC_EGD):
+                                l_len = old_header[4]
+                                old_label = old_header[5:5 + l_len].decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
+
                 conn.execute(
                     """INSERT INTO vault (label, original_name, original_path, is_dir, size_bytes, enc_key, drive_file_id, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1757,6 +1857,9 @@ class GdeMCPServer:
 
                 try:
                     atomic_copy_file(temp_enc, out_enc, mode=0o644)
+                    if old_label and old_label != label:
+                        conn.execute("DELETE FROM vault WHERE label = ? AND drive_file_id IS NULL", (old_label,))
+                        conn.commit()
                 except Exception as e:
                     conn.execute("DELETE FROM vault WHERE label = ?", (label,))
                     conn.commit()
@@ -1785,13 +1888,36 @@ class GdeMCPServer:
 
             mcp = GDriveMCP()
             drive_file_id = None
+            upload_err = None
             try:
                 mcp.start()
                 drive_file_id = mcp.upload_file(temp_enc, f"{label}.enc")
                 conn.execute("UPDATE vault SET drive_file_id = ? WHERE label = ?", (drive_file_id, label))
                 conn.commit()
+            except Exception as e:
+                upload_err = e
             finally:
                 mcp.close()
+
+            if upload_err:
+                fallback_enc = Path.cwd() / f"{target.name}.enc"
+                if fallback_enc.exists() and not force:
+                    fallback_enc = Path.cwd() / f"{target.name}.{secrets.token_hex(4)}.enc"
+                atomic_copy_file(temp_enc, fallback_enc, mode=0o644)
+                return {
+                    "status": "warning",
+                    "mode": "fallback_local",
+                    "label": label,
+                    "original_name": target.name,
+                    "original_path": str(target),
+                    "is_dir": bool(is_dir),
+                    "size_bytes": size_bytes,
+                    "drive_file_id": None,
+                    "saved_local_path": str(fallback_enc),
+                    "warning": f"Google Drive upload failed ({upload_err}). Ciphertext safely saved locally to disk to prevent data loss.",
+                    "unreadable_skipped": len(unreadable_items),
+                    "special_skipped": len(special_files)
+                }
 
             return {
                 "status": "success",
@@ -1806,10 +1932,13 @@ class GdeMCPServer:
                 "special_skipped": len(special_files)
             }
 
-    def _tool_decrypt(self, enc_path_str: str, dest_dir: str = ".", force: bool = True, key_hex: str = None, conn_override=None):
+    def _tool_decrypt(self, enc_path_str: str, dest_dir: str = ".", force: bool = False, key_hex: str = None, conn_override=None):
         enc_path = Path(enc_path_str).expanduser().resolve()
         if not enc_path.exists():
             raise FileNotFoundError(f"Encrypted file '{enc_path}' not found.")
+
+        if not is_safe_mcp_path(enc_path):
+            raise PermissionError(f"Access to encrypted file '{enc_path}' is restricted for MCP security.")
 
         with open(enc_path, "rb") as f:
             enc_data = f.read()
@@ -1853,12 +1982,18 @@ class GdeMCPServer:
             safe_name = f"{label}.restored"
 
         base_dest_dir = Path(dest_dir).resolve()
+        if not is_safe_mcp_path(base_dest_dir):
+            raise PermissionError(f"Access to destination directory '{base_dest_dir}' is restricted for MCP security.")
+
         dest = base_dest_dir / safe_name
         if not is_subpath(dest.parent, base_dest_dir):
             raise ValueError(f"Path traversal detected: {dest}")
 
+        if not is_safe_mcp_path(dest):
+            raise PermissionError(f"Access to destination path '{dest}' is restricted for MCP security.")
+
         if (dest.exists() or os.path.islink(dest)) and not force:
-            raise FileExistsError(f"Destination '{dest}' already exists and force=False.")
+            raise FileExistsError(f"Destination '{dest}' already exists and force=False. Set force=True to overwrite.")
 
         if os.path.islink(dest):
             dest.unlink()
@@ -1914,7 +2049,7 @@ class GdeMCPServer:
             })
         return {"total": len(items), "items": items}
 
-    def _tool_download(self, item_id_or_label, dest_dir=".", force=True, conn_override=None):
+    def _tool_download(self, item_id_or_label, dest_dir=".", force=False, conn_override=None):
         conn = conn_override or init_db()
         cur = conn.cursor()
         if isinstance(item_id_or_label, int) or str(item_id_or_label).isdigit():
@@ -1934,12 +2069,18 @@ class GdeMCPServer:
             safe_name = f"{label}.restored"
 
         base_dest_dir = Path(dest_dir).resolve()
+        if not is_safe_mcp_path(base_dest_dir):
+            raise PermissionError(f"Access to destination directory '{base_dest_dir}' is restricted for MCP security.")
+
         dest = base_dest_dir / safe_name
         if not is_subpath(dest.parent, base_dest_dir):
             raise ValueError(f"Path traversal detected: {dest}")
 
+        if not is_safe_mcp_path(dest):
+            raise PermissionError(f"Access to destination path '{dest}' is restricted for MCP security.")
+
         if (dest.exists() or os.path.islink(dest)) and not force:
-            raise FileExistsError(f"Destination '{dest}' already exists and force=False.")
+            raise FileExistsError(f"Destination '{dest}' already exists and force=False. Set force=True to overwrite.")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -2023,10 +2164,12 @@ class GdeMCPServer:
         tokens = (mcp_cfg / "tokens.json").exists()
         return {
             "server": "GDE MCP Server",
-            "version": "1.5.0",
+            "version": VERSION,
             "vault_path": str(DB_PATH),
             "vault_entries": total_items,
             "language": CURRENT_LANG,
+            "readonly_mode": self.readonly,
+            "allowed_roots": os.environ.get("GDE_ALLOWED_ROOTS", None),
             "gdrive_oauth_keys_present": gcp_keys,
             "gdrive_token_active": tokens
         }
@@ -2056,7 +2199,10 @@ class GdeMCPServer:
         else:
             raw_path = Path(out_path).expanduser()
             parent_dir = raw_path.parent.resolve()
-            target_path = parent_dir / raw_path.name
+            target_path = (parent_dir / raw_path.name).resolve()
+
+        if not is_safe_mcp_path(target_path):
+            raise PermissionError(f"Access to path '{target_path}' is restricted for MCP security.")
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if os.path.islink(target_path):
@@ -2089,6 +2235,9 @@ class GdeMCPServer:
         path = Path(in_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError(f"Backup file '{path}' not found.")
+
+        if not is_safe_mcp_path(path):
+            raise PermissionError(f"Access to path '{path}' is restricted for MCP security.")
 
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -2534,7 +2683,7 @@ def self_test():
                 "arguments": {
                     "enc_path": str(enc_out_path),
                     "dest_dir": str(mcp_restore_dir),
-                    "force": True
+                    "force": False
                 }
             }
         }, conn_override=test_conn)
@@ -2543,6 +2692,81 @@ def self_test():
         restored_mcp_file = mcp_restore_dir / "mcp_payload.txt"
         if not restored_mcp_file.exists() or restored_mcp_file.read_text(encoding="utf-8") != mcp_test_payload:
             raise RuntimeError("MCP decrypted file content mismatch")
+
+        # Test 11e-2: decrypt with force=False when destination already exists MUST fail (Safety check)
+        dec_conflict_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 61,
+            "method": "tools/call",
+            "params": {
+                "name": "gde_decrypt",
+                "arguments": {
+                    "enc_path": str(enc_out_path),
+                    "dest_dir": str(mcp_restore_dir),
+                    "force": False
+                }
+            }
+        }, conn_override=test_conn)
+        if not dec_conflict_res.get("result", {}).get("isError"):
+            raise RuntimeError("MCP gde_decrypt did not fail when destination already exists and force=False")
+
+        # Test 11e-3: Dangerous system path blocking
+        bad_path_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 62,
+            "method": "tools/call",
+            "params": {
+                "name": "gde_encrypt",
+                "arguments": {
+                    "path": "/etc/hostname",
+                    "local_only": True
+                }
+            }
+        }, conn_override=test_conn)
+        if not bad_path_res.get("result", {}).get("isError"):
+            raise RuntimeError("MCP gde_encrypt permitted encryption of dangerous system path /etc/hostname")
+
+        # Test 11e-4: Read-only server mode
+        ro_server = GdeMCPServer(readonly=True)
+        ro_res = ro_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 63,
+            "method": "tools/call",
+            "params": {
+                "name": "gde_encrypt",
+                "arguments": {
+                    "path": str(mcp_test_file),
+                    "local_only": True
+                }
+            }
+        }, conn_override=test_conn)
+        if not ro_res.get("result", {}).get("isError"):
+            raise RuntimeError("MCP read-only server permitted mutation tool gde_encrypt")
+
+        # Test 11e-5: MCP cloud upload failure saves ciphertext fallback locally! (No ciphertext loss)
+        cloud_fail_file = tmp / "cloud_fail_test.txt"
+        cloud_fail_file.write_text("Data penting yang tidak boleh hilang saat upload gagal!", encoding="utf-8")
+        cloud_res = mcp_server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 64,
+            "method": "tools/call",
+            "params": {
+                "name": "gde_encrypt",
+                "arguments": {
+                    "path": str(cloud_fail_file),
+                    "local_only": False
+                }
+            }
+        }, conn_override=test_conn)
+        cloud_body = json.loads(cloud_res["result"]["content"][0]["text"])
+        if cloud_body.get("mode") != "fallback_local":
+            raise RuntimeError(f"Expected fallback_local on cloud failure, got: {cloud_body}")
+        saved_fallback = Path(cloud_body["saved_local_path"])
+        if not saved_fallback.exists():
+            raise RuntimeError(f"Fallback ciphertext was not saved to disk: {saved_fallback}")
+        if saved_fallback.exists():
+            saved_fallback.unlink()
+
         enc_out_path.unlink()
 
         # 11f. MCP tools/call gde_list
@@ -2574,6 +2798,28 @@ def self_test():
         if not bad_tool_res.get("result", {}).get("isError"):
             raise RuntimeError(f"MCP unknown tool did not return isError=True: {bad_tool_res}")
 
+        # 12. Scheduled Local Backup Versioning & No-Orphan-Key Test
+        sched_test_file = tmp / "sched_data.txt"
+        sched_test_file.write_text("Versi 1", encoding="utf-8")
+        ret1 = cmd_encrypt(str(sched_test_file), local_only=True, force=True, exit_on_error=False, output_filename="sched_data.v1.enc", conn_override=test_conn)
+        sched_test_file.write_text("Versi 2", encoding="utf-8")
+        ret2 = cmd_encrypt(str(sched_test_file), local_only=True, force=True, exit_on_error=False, output_filename="sched_data.v2.enc", conn_override=test_conn)
+        if ret1 != 0 or ret2 != 0:
+            raise RuntimeError("cmd_encrypt versioned output failed")
+        v1_path = Path.cwd() / "sched_data.v1.enc"
+        v2_path = Path.cwd() / "sched_data.v2.enc"
+        if not v1_path.exists() or not v2_path.exists():
+            raise RuntimeError("Versioned ciphertext files do not exist simultaneously on disk")
+        cur = test_conn.cursor()
+        cur.execute("SELECT count(*) FROM vault WHERE original_name = 'sched_data.txt'")
+        count_vault = cur.fetchone()[0]
+        if count_vault < 2:
+            raise RuntimeError(f"Vault entries missing for versioned scheduled backups: {count_vault}")
+        if v1_path.exists():
+            v1_path.unlink()
+        if v2_path.exists():
+            v2_path.unlink()
+
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Folder (empty dirs, 0555 readonly & 0755 exec): {C.GREEN}OK{C.RESET}")
@@ -2590,6 +2836,9 @@ def self_test():
     print(f"    {C.GREEN}•{C.RESET} Scheduled Backup Duration Parser (s, m, h, d, y): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Bilingual Support & Humanizer-ID (ID/EN): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Model Context Protocol (MCP) Server (JSON-RPC stdio & tools): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} MCP Agent Hardening (force=False safety, safe paths, read-only mode): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} MCP Cloud Upload Fallback (Zero Ciphertext Loss Guarantee): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Scheduled Local Backup Versioning (Zero Orphan Keys): {C.GREEN}OK{C.RESET}")
 
 
 def main():
@@ -2612,6 +2861,10 @@ def main():
     if "--local" in args:
         local_only = True
         args.remove("--local")
+
+    if any(v in args for v in ("-v", "--version", "version")):
+        print(f"GDE v{VERSION} - Google Drive Encryption (ChaCha20-Poly1305 256)")
+        sys.exit(0)
 
     # Parse --lang parameter
     i = 0
@@ -2663,48 +2916,53 @@ def main():
             sys.exit(1)
 
     if not args or args[0] in ("-h", "--help"):
+        banner_title = f"GDE v{VERSION} - Google Drive Encryption (ChaCha20-Poly1305 256)"
+        banner_border = "═" * (len(banner_title) + 2)
+
         if CURRENT_LANG == "en":
-            print(f"\n{C.BOLD}{C.CYAN}  ╔═════════════════════════════════════════════════════════════╗{C.RESET}")
-            print(f"{C.BOLD}{C.CYAN}  ║   GDE - Google Drive Encryption (ChaCha20-Poly1305 256)     ║{C.RESET}")
-            print(f"{C.BOLD}{C.CYAN}  ╚═════════════════════════════════════════════════════════════╝{C.RESET}\n")
+            print(f"\n{C.BOLD}{C.CYAN}  ╔{banner_border}╗{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}  ║ {banner_title} ║{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}  ╚{banner_border}╝{C.RESET}\n")
             print(f"{C.BOLD}Usage:{C.RESET}")
-            print(f"  {C.GREEN}gde {C.CYAN}<file/folder>{C.RESET}              Encrypt & upload to GDrive (direct file, zipped folder)")
-            print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}             Local encryption -> save as <name>.enc")
-            print(f"  {C.GREEN}gde {C.CYAN}<path> {C.YELLOW}--time <duration>{C.RESET}     Automatic periodic backup (e.g., 30s, 24h, 7d, 1y)")
-            print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}         Decrypt local .enc file using vault key")
-            print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                       List files in vault & interactive download")
-            print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET}        Download from GDrive & restore directly")
-            print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}         Export vault keys backup to JSON file (chmod 600)")
-            print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}         Import vault keys from backup JSON file")
-            print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}           Set default interface language (ID / EN)")
-            print(f"  {C.GREEN}gde {C.CYAN}mcp{C.RESET}                        Start Model Context Protocol (MCP) server for AI Agents")
-            print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                       Run internal verification self-test")
-            print(f"  {C.GRAY}Options:{C.RESET}")
-            print(f"    {C.YELLOW}--time / -t <duration>{C.RESET}      Schedule interval: s (sec), m (min), h (hours), d (days), y (years)")
-            print(f"    {C.YELLOW}--lang <id|en>{C.RESET}              Override language for current command")
-            print(f"    {C.YELLOW}--force / -f{C.RESET}                Skip overwrite confirmation prompt")
-            print(f"    {C.YELLOW}--allow-partial{C.RESET}             Ignore unreadable file errors (exit code 0 instead of 2)\n")
+            print(f"  {C.GREEN}gde {C.CYAN}<file/folder>{C.RESET}               Encrypt & upload to GDrive (direct file, zipped folder)")
+            print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}              Local encryption -> save as <name>.enc")
+            print(f"  {C.GREEN}gde {C.CYAN}<path> {C.YELLOW}--time <duration>{C.RESET}    Automatic periodic backup (e.g., 30s, 24h, 7d, 1y)")
+            print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}          Decrypt local .enc file using vault key")
+            print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                        List files in vault & interactive download")
+            print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET}         Download from GDrive & restore directly")
+            print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}          Export vault keys backup to JSON file (chmod 600)")
+            print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}          Import vault keys from backup JSON file")
+            print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}            Set default interface language (ID / EN)")
+            print(f"  {C.GREEN}gde {C.CYAN}mcp [--readonly]{C.RESET}            Start Model Context Protocol (MCP) server for AI Agents")
+            print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                        Run internal verification self-test\n")
+            print(f"{C.GRAY}Options:{C.RESET}")
+            print(f"    {C.YELLOW}--time / -t <duration>{C.RESET}          Schedule interval: s (sec), m (min), h (hours), d (days), y (years)")
+            print(f"    {C.YELLOW}--lang <id|en>{C.RESET}                Override language for current command")
+            print(f"    {C.YELLOW}--force / -f{C.RESET}                  Skip overwrite confirmation prompt")
+            print(f"    {C.YELLOW}--allow-partial{C.RESET}               Ignore unreadable file errors (exit code 0 instead of 2)")
+            print(f"    {C.YELLOW}--version / -v{C.RESET}                Show version information\n")
         else:
-            print(f"\n{C.BOLD}{C.CYAN}  ╔═════════════════════════════════════════════════════════════╗{C.RESET}")
-            print(f"{C.BOLD}{C.CYAN}  ║   GDE - Google Drive Encryption (ChaCha20-Poly1305 256)     ║{C.RESET}")
-            print(f"{C.BOLD}{C.CYAN}  ╚═════════════════════════════════════════════════════════════╝{C.RESET}\n")
+            print(f"\n{C.BOLD}{C.CYAN}  ╔{banner_border}╗{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}  ║ {banner_title} ║{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}  ╚{banner_border}╝{C.RESET}\n")
             print(f"{C.BOLD}Penggunaan:{C.RESET}")
-            print(f"  {C.GREEN}gde {C.CYAN}<file/folder>{C.RESET}              Enkripsi & upload ke GDrive (file langsung, folder di-zip)")
-            print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}             Enkripsi lokal -> simpan ke <nama>.enc")
-            print(f"  {C.GREEN}gde {C.CYAN}<path> {C.YELLOW}--time <durasi>{C.RESET}     Backup berjadwal otomatis (misal: 30s, 24h, 7d, 1y)")
-            print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}         Dekripsi file .enc lokal pakai kunci vault")
-            print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                       Daftar file di vault & download interaktif")
-            print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET}        Download dari GDrive & restore langsung")
-            print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}         Export cadangan kunci vault ke file JSON (chmod 600)")
-            print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}         Import kunci vault dari file backup JSON")
-            print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}           Ubah bahasa tampilan default (ID / EN)")
-            print(f"  {C.GREEN}gde {C.CYAN}mcp{C.RESET}                        Jalankan server Model Context Protocol (MCP) untuk AI Agent")
-            print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                       Jalankan internal verification self-test")
-            print(f"  {C.GRAY}Opsi tambahan:{C.RESET}")
-            print(f"    {C.YELLOW}--time / -t <durasi>{C.RESET}         Interval jadwal: s (detik), m (menit), h (jam), d (hari), y (tahun)")
-            print(f"    {C.YELLOW}--lang <id|en>{C.RESET}              Override bahasa untuk perintah ini")
-            print(f"    {C.YELLOW}--force / -f{C.RESET}                 Lewati konfirmasi penimpaan file saat restore/dekripsi")
-            print(f"    {C.YELLOW}--allow-partial{C.RESET}              Abaikan error file/folder tak terbaca (exit code 0 alih-alih 2)\n")
+            print(f"  {C.GREEN}gde {C.CYAN}<file/folder>{C.RESET}               Enkripsi & upload ke GDrive (file langsung, folder di-zip)")
+            print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}              Enkripsi lokal -> simpan ke <nama>.enc")
+            print(f"  {C.GREEN}gde {C.CYAN}<path> {C.YELLOW}--time <durasi>{C.RESET}      Backup berjadwal otomatis (misal: 30s, 24h, 7d, 1y)")
+            print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}          Dekripsi file .enc lokal pakai kunci vault")
+            print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                        Daftar file di vault & download interaktif")
+            print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET}         Download dari GDrive & restore langsung")
+            print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}          Export cadangan kunci vault ke file JSON (chmod 600)")
+            print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}          Import kunci vault dari file backup JSON")
+            print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}            Ubah bahasa tampilan default (ID / EN)")
+            print(f"  {C.GREEN}gde {C.CYAN}mcp [--readonly]{C.RESET}            Jalankan server Model Context Protocol (MCP) untuk AI Agent")
+            print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                        Jalankan internal verification self-test\n")
+            print(f"{C.GRAY}Opsi tambahan:{C.RESET}")
+            print(f"    {C.YELLOW}--time / -t <durasi>{C.RESET}          Interval jadwal: s (detik), m (menit), h (jam), d (hari), y (tahun)")
+            print(f"    {C.YELLOW}--lang <id|en>{C.RESET}                Override bahasa untuk perintah ini")
+            print(f"    {C.YELLOW}--force / -f{C.RESET}                  Lewati konfirmasi penimpaan file saat restore/dekripsi")
+            print(f"    {C.YELLOW}--allow-partial{C.RESET}               Abaikan error file/folder tak terbaca (exit code 0 alih-alih 2)")
+            print(f"    {C.YELLOW}--version / -v{C.RESET}                Tampilkan informasi versi\n")
         sys.exit(0)
 
     cmd = args[0]
@@ -2752,7 +3010,8 @@ def main():
         if time_interval is not None:
             log_err("Flag '--time' tidak berlaku untuk mode MCP.")
             sys.exit(1)
-        server = GdeMCPServer()
+        readonly = ("--readonly" in args) or (os.environ.get("GDE_MCP_READONLY", "0").lower() in ("1", "true", "yes"))
+        server = GdeMCPServer(readonly=readonly)
         server.serve_stdio()
     elif cmd == "test":
         if time_interval is not None:

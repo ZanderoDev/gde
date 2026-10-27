@@ -55,7 +55,7 @@ Built on **zero-knowledge** principles: Google only receives random ciphertext b
 - **Smart Packing**: Single files are encrypted directly without ZIP overhead. Directories are automatically zipped recursively before encryption, fully preserving executable permissions (`0755`), read-only folders (`0555`), symlinks (relative & absolute), and empty subdirectories. Hardened with Zip Slip protection.
 - **Anti-Tampering**: File labels are bound to AAD (Additional Authenticated Data). Any manipulation of ciphertext or label header causes Poly1305 verification to fail and reject decryption.
 - **Local Vault & Key Backup**: Local SQLite database stored with strict permissions (`chmod 600`). Includes `export-keys` and `import-keys` commands for key backup and migration.
-- **Access Detection & Warnings**: Unreadable files (`PermissionError`) and special devices (FIFOs, sockets) are detected and explicitly reported (exit code 2 on partial backup unless `--force` / `--allow-partial`).
+- **Access Detection & Warnings**: Unreadable files (`PermissionError`) and special devices (FIFOs, sockets) are detected and explicitly reported (exit code 2 on partial backup unless `--allow-partial`).
 - **Clean CLI Interface**: Formatted colored tables with interactive download prompts.
 - **Built-in MCP Server for AI Agents**: Full Model Context Protocol (`2024-11-05`) support via stdio JSON-RPC. AI agents (Claude Desktop, Cursor, Antigravity, Cline) can directly manage encryption, decryption, downloads, and vault status.
 - **Native MCP Integration**: Direct stdio JSON-RPC communication with upstream Google Drive MCP runner (resilient against stdout log pollution).
