@@ -254,7 +254,7 @@ gde test
 - **Error token revoked/expired:**
   Jalankan ulang otorisasi akun:
   ```bash
-  npx -y @piotr-agier/google-drive-mcp
+  npx -y @piotr-agier/google-drive-mcp auth
   ```
 - **Command `gde` tidak ditemukan:**
   Tambahkan path bin lokal ke konfigurasi shell:
