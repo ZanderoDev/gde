@@ -90,9 +90,14 @@ GDE pakai runner MCP dari `@piotr-agier/google-drive-mcp` buat upload dan downlo
 ### 3. Konfigurasi OAuth Consent Screen
 
 1. Buka **APIs & Services** > **OAuth consent screen**.
-2. Di bagian **Branding**, isi kolom wajibnya (App name, User support email, Developer contact).
-3. Di bagian **Audience**, pilih **External** (atau **Internal** kalau kamu pakai akun Google Workspace). Terus tambahkan email Google yang mau dipakai login sebagai **test user**.
-4. Di bagian **Data Access**, tambahkan scope berikut (set yang direkomendasikan dokumentasi package-nya):
+2. Di bagian **Branding**, isi kolom wajibnya:
+   - App name: misalnya `GDE Vault MCP`
+   - User support email: email Google kamu
+   - Developer contact email: email Google kamu
+3. Di bagian **Audience**:
+   - Pilih **External** (atau **Internal** kalau kamu pakai Google Workspace).
+   - Tambahkan email Google kamu ke daftar **Test users** (wajib jika status masih Testing).
+4. Di bagian **Data Access**, tambahkan scope yang direkomendasikan dokumentasi resminya:
    - `https://www.googleapis.com/auth/drive.file`
    - `https://www.googleapis.com/auth/documents`
    - `https://www.googleapis.com/auth/spreadsheets`
@@ -103,11 +108,15 @@ GDE pakai runner MCP dari `@piotr-agier/google-drive-mcp` buat upload dan downlo
    - `https://www.googleapis.com/auth/calendar.events`
 5. Simpan konfigurasinya.
 
+> **Tips Token Awet (Bebas Expire 7 Hari):**
+> Google punya kebijakan bahwa app berstatus **Testing** refresh token-nya hangus tiap 7 hari. Supaya kamu nggak perlu login ulang tiap minggu, klik tombol **"Publish App"** di halaman OAuth consent screen agar statusnya jadi **In production**. Karena ini dipakai pribadi, kamu nggak perlu verifikasi verifikasi publik dari Google.
+
 ### 4. Bikin OAuth 2.0 Client ID
 
 1. Buka **APIs & Services** > **Credentials**.
 2. Klik **Create Credentials** > **OAuth client ID**.
-3. Pilih Application type: **Desktop app** (ini penting, jangan pilih tipe lain).
+3. Pilih Application type: **Desktop app** (penting banget!).
+   > **Kenapa harus Desktop app?** Tipe ini otomatis menerima redirect callback dinamis ke loopback lokal `http://127.0.0.1:<port>/oauth2callback` tanpa perlu daftarin URI manual. Kalau kamu salah pilih *Web application*, otorisasi bakal gagal dengan error `redirect_uri_mismatch`.
 4. Kasih nama (misal: `GDE Client`), lalu klik **Create**.
 5. Download file JSON kredensialnya.
 
@@ -125,22 +134,23 @@ cp /path/ke/credentials.json ~/.config/google-drive-mcp/gcp-oauth.keys.json
 Urutan lokasi yang dicek server (yang pertama ketemu langsung dipakai):
 
 1. Path di environment variable `GOOGLE_DRIVE_OAUTH_CREDENTIALS`, kalau diset.
-2. `~/.config/google-drive-mcp/gcp-oauth.keys.json` (lokasi yang direkomendasikan). Kalau `XDG_CONFIG_HOME` diset, dia menggantikan `~/.config`.
-3. Root project, sebagai fallback lama. Ini nggak bisa diandalkan kalau dijalankan lewat `npx`.
+2. `~/.config/google-drive-mcp/gcp-oauth.keys.json` (lokasi rekomendasi; jika `XDG_CONFIG_HOME` ada, dia menggantikan `~/.config`).
+3. Root project, sebagai fallback lama (kurang reliabel kalau dijalankan lewat `npx`).
 
 Kalau file nggak ketemu di ketiga lokasi itu, server berhenti dengan pesan `OAuth credentials not found`.
 
 ### 6. Login dan Otorisasi Akun
 
-Jalankan perintah ini di terminal:
+Jalankan perintah otorisasi di terminal:
 
 ```bash
 npx -y @piotr-agier/google-drive-mcp auth
 ```
 
-Browser bakal terbuka buat konfirmasi izin akses Google Drive. Setelah disetujui, token otomatis tersimpan di `~/.config/google-drive-mcp/tokens.json`.
+Browser bakal terbuka otomatis buat konfirmasi izin akses Google Drive. Setelah disetujui, token tersimpan di `~/.config/google-drive-mcp/tokens.json` dengan permission aman (`0600`).
 
-> **Jangan commit** file kredensial (`gcp-oauth.keys.json`) maupun `tokens.json` ke repo mana pun.
+> - **Port bentrok?** Secara default server mencoba port `3000–3004`. Kalau port itu lagi dipakai (misal dev server React/Vite), ganti port awal lewat env var: `export GOOGLE_DRIVE_MCP_AUTH_PORT=3100`.
+> - **Jangan commit** file kredensial (`gcp-oauth.keys.json`) maupun `tokens.json` ke repo mana pun.
 
 ---
 
@@ -401,6 +411,12 @@ gde test
 
   Kalau OAuth consent screen-mu masih berstatus **Testing**, refresh token dari Google kedaluwarsa setelah 7 hari, jadi kamu perlu login ulang tiap seminggu. Di status **In production**, refresh token umumnya nggak kedaluwarsa kecuali di-revoke atau lama nggak dipakai.
 - **`OAuth credentials not found`:** file `gcp-oauth.keys.json` belum ada di lokasi yang dicek server. Cek lagi [langkah 5](#5-simpan-kredensial-mcp).
+- **Error `redirect_uri_mismatch`:** ini terjadi kalau saat membuat kredensial di Google Cloud Console kamu memilih *Web application* alih-alih *Desktop app*. Solusinya: buat OAuth Client ID baru dengan tipe **Desktop app**, download file JSON-nya, lalu ganti `gcp-oauth.keys.json`.
+- **Port callback bentrok (`EADDRINUSE`):** secara default server otorisasi memakai port 3000–3004. Kalau port itu lagi dipakai dev server lokal, pindahkan port awal:
+  ```bash
+  export GOOGLE_DRIVE_MCP_AUTH_PORT=3100
+  npx -y @piotr-agier/google-drive-mcp auth
+  ```
 - **Command `gde` nggak ketemu:** tambahkan path bin lokal ke konfigurasi shell:
 
   ```bash
