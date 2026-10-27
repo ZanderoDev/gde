@@ -34,6 +34,7 @@ venv.bak/
 *.enc
 *.db
 *.sqlite
+*.zip
 vault.db
 tokens.json
 gcp-oauth.keys.json
