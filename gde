@@ -590,9 +590,18 @@ class GDriveMCP:
                 return str(file_id)
         except Exception:
             pass
-        m = re.search(r"(?:fileId|id)['\"]?:\s*['\"]([^'\"]+)['\"]", text_out, re.IGNORECASE)
-        if m:
-            return m.group(1)
+
+        patterns = [
+            r"(?:fileId|id)\s*[:=]\s*['\"]?([a-zA-Z0-9_\-]+)",
+            r"drive\.google\.com/file/d/([a-zA-Z0-9_\-]+)",
+            r"(?:file/d/|open\?id=)([a-zA-Z0-9_\-]+)",
+            r"^ID:\s*(\S+)"
+        ]
+        for pat in patterns:
+            m = re.search(pat, text_out, re.IGNORECASE | re.MULTILINE)
+            if m:
+                return m.group(1).strip("'\"")
+
         raise RuntimeError(f"Gagal mengambil fileId dari response Google Drive MCP: {text_out[:200]}")
 
     def download_file(self, file_id, local_path):
@@ -2744,28 +2753,36 @@ def self_test():
             raise RuntimeError("MCP read-only server permitted mutation tool gde_encrypt")
 
         # Test 11e-5: MCP cloud upload failure saves ciphertext fallback locally! (No ciphertext loss)
-        cloud_fail_file = tmp / "cloud_fail_test.txt"
-        cloud_fail_file.write_text("Data penting yang tidak boleh hilang saat upload gagal!", encoding="utf-8")
-        cloud_res = mcp_server.handle_request({
-            "jsonrpc": "2.0",
-            "id": 64,
-            "method": "tools/call",
-            "params": {
-                "name": "gde_encrypt",
-                "arguments": {
-                    "path": str(cloud_fail_file),
-                    "local_only": False
+        orig_upload = GDriveMCP.upload_file
+        try:
+            def mock_fail_upload(self, *args, **kwargs):
+                raise RuntimeError("Simulated network/MCP upload failure")
+            GDriveMCP.upload_file = mock_fail_upload
+
+            cloud_fail_file = tmp / "cloud_fail_test.txt"
+            cloud_fail_file.write_text("Data penting yang tidak boleh hilang saat upload gagal!", encoding="utf-8")
+            cloud_res = mcp_server.handle_request({
+                "jsonrpc": "2.0",
+                "id": 64,
+                "method": "tools/call",
+                "params": {
+                    "name": "gde_encrypt",
+                    "arguments": {
+                        "path": str(cloud_fail_file),
+                        "local_only": False
+                    }
                 }
-            }
-        }, conn_override=test_conn)
-        cloud_body = json.loads(cloud_res["result"]["content"][0]["text"])
-        if cloud_body.get("mode") != "fallback_local":
-            raise RuntimeError(f"Expected fallback_local on cloud failure, got: {cloud_body}")
-        saved_fallback = Path(cloud_body["saved_local_path"])
-        if not saved_fallback.exists():
-            raise RuntimeError(f"Fallback ciphertext was not saved to disk: {saved_fallback}")
-        if saved_fallback.exists():
-            saved_fallback.unlink()
+            }, conn_override=test_conn)
+            cloud_body = json.loads(cloud_res["result"]["content"][0]["text"])
+            if cloud_body.get("mode") != "fallback_local":
+                raise RuntimeError(f"Expected fallback_local on cloud failure, got: {cloud_body}")
+            saved_fallback = Path(cloud_body["saved_local_path"])
+            if not saved_fallback.exists():
+                raise RuntimeError(f"Fallback ciphertext was not saved to disk: {saved_fallback}")
+            if saved_fallback.exists():
+                saved_fallback.unlink()
+        finally:
+            GDriveMCP.upload_file = orig_upload
 
         enc_out_path.unlink()
 
