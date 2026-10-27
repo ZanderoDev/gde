@@ -12,9 +12,9 @@
 
 # GDE (Google Drive Encryption)
 
-CLI tool buat enkripsi file atau folder secara lokal sebelum di-upload ke Google Drive via MCP (`@piotr-agier/google-drive-mcp`).
+CLI tool buat mengenkripsi file atau folder secara lokal sebelum di-upload ke Google Drive lewat MCP (`@piotr-agier/google-drive-mcp`).
 
-Prinsipnya **zero-knowledge**: Google cuma nerima blob ciphertext acak (`gde_<label>.enc`). Kunci enkripsi dan metadata nama asli disimpan aman di vault SQLite lokal kamu (`~/.config/gde/vault.db`). Pihak Google atau siapa pun yang mengakses akun Drive nggak bakal bisa baca isi maupun nama asli filenya.
+Prinsipnya **zero-knowledge**: Google cuma nerima blob ciphertext acak (`gde_<label>.enc`). Kunci enkripsi dan nama asli file disimpan di vault SQLite lokal (`~/.config/gde/vault.db`). Google, atau siapa pun yang punya akses ke akun Drive, nggak bakal bisa baca isi maupun nama asli filenya.
 
 ---
 
@@ -46,89 +46,107 @@ Prinsipnya **zero-knowledge**: Google cuma nerima blob ciphertext acak (`gde_<la
 
 ## Fitur
 
-- **ChaCha20-Poly1305 (256-bit AEAD)**: Standar IETF RFC 8439. Cepat, ringan di CPU, dan kebal cache-timing attack tanpa butuh akselerasi hardware AES-NI.
-- **Kunci Unik per File**: Setiap file dienkripsi dengan kunci 32-byte independen (`secrets.token_bytes(32)`). Tidak ada master key tunggal.
-- **Smart Packing**: File tunggal langsung dienkripsi tanpa overhead ZIP. Folder otomatis di-zip rekursif sebelum dienkripsi dengan mempertahankan permission executable (`0755`), direktori read-only (`0555`), symlink (relatif & absolut), dan subfolder kosong. Dilengkapi proteksi Zip Slip.
-- **Anti-Tampering**: Label file terikat ke AAD (Additional Authenticated Data). Kalau isi file atau label dimanipulasi, tag Poly1305 langsung menolak dekripsi.
-- **Vault Lokal & Backup Kunci**: SQLite lokal disimpan dengan permission ketat (`chmod 600`). Dilengkapi perintah `export-keys` dan `import-keys` untuk backup/migrasi kunci.
-- **Deteksi Akses & Peringatan**: File/folder yang tidak dapat dibaca (`PermissionError`) atau file khusus (FIFO/device) dideteksi dan dilaporkan eksplisit (exit code 2 untuk backup parsial kecuali `--force`).
-- **Tampilan CLI Rapi**: Output tabel berwarna dengan opsi download interaktif.
-- **Server MCP Bawaan untuk AI Agent**: Mendukung protokol Model Context Protocol (`2024-11-05`) lewat stdio JSON-RPC. AI Agent (Claude Desktop, Cursor, Antigravity, Cline) bisa langsung mengelola enkripsi, dekripsi, dan sinkronisasi vault.
-- **Native MCP Integration**: Komunikasi langsung ke runner Google Drive MCP lewat stdio JSON-RPC (aman dari polusi log stdout).
+- **ChaCha20-Poly1305 (256-bit AEAD)**: standar IETF RFC 8439. Cepat, ringan di CPU, dan kebal cache-timing attack tanpa butuh akselerasi hardware AES-NI.
+- **Kunci unik per file**: tiap file dienkripsi dengan kunci 32-byte yang independen (`secrets.token_bytes(32)`). Nggak ada master key tunggal.
+- **Smart packing**: file tunggal langsung dienkripsi tanpa overhead ZIP. Folder di-zip secara rekursif dulu sebelum dienkripsi, dengan permission executable (`0755`), direktori read-only (`0555`), symlink (relatif dan absolut), dan subfolder kosong tetap dipertahankan. Ada juga proteksi Zip Slip.
+- **Anti-tampering**: label file terikat ke AAD (Additional Authenticated Data). Kalau isi file atau labelnya diubah, tag Poly1305 langsung menolak dekripsi.
+- **Vault lokal dan backup kunci**: SQLite lokal disimpan dengan permission ketat (`chmod 600`). Ada perintah `export-keys` dan `import-keys` buat backup atau migrasi kunci.
+- **Deteksi akses dan peringatan**: file atau folder yang nggak bisa dibaca (`PermissionError`) dan file khusus (FIFO/device) dideteksi lalu dilaporkan secara eksplisit. Backup parsial berakhir dengan exit code 2 kecuali kamu pakai `--force`.
+- **Tampilan CLI rapi**: output tabel berwarna dengan opsi download interaktif.
+- **Server MCP bawaan buat AI agent**: mendukung Model Context Protocol (`2024-11-05`) lewat stdio JSON-RPC. AI agent (Claude Desktop, Cursor, Antigravity, Cline) bisa langsung ngatur enkripsi, dekripsi, dan sinkronisasi vault.
+- **Native MCP integration**: komunikasi langsung ke runner Google Drive MCP lewat stdio JSON-RPC, jadi aman dari polusi log stdout.
 
 ---
 
 ## Requirements
 
 - Linux atau macOS
-- Python 3.8+ (dan modul `cryptography`)
-- Node.js & npx v18+ (dibutuhkan untuk menjalankan runner GDrive MCP)
+- Python 3.8+ (plus modul `cryptography`)
+- Node.js dan npx v18+ (buat menjalankan runner GDrive MCP)
 
 ---
 
 ## Setup Google Drive MCP
 
-GDE memanfaatkan runner MCP dari `@piotr-agier/google-drive-mcp` untuk upload dan download ke Google Drive. Ikuti langkah setup berikut:
+GDE pakai runner MCP dari `@piotr-agier/google-drive-mcp` buat upload dan download ke Google Drive. Langkah di bawah ini mengikuti [setup guide resmi package-nya](https://github.com/piotr-agier/google-drive-mcp/blob/master/docs/setup.md).
 
 ### 1. Bikin Project di Google Cloud Console
-1. Buka [Google Cloud Console](https://console.cloud.google.com/).
-2. Buat project baru (misal: `gde-vault`).
 
-### 2. Aktifkan Google Drive API
-1. Buka menu **APIs & Services** > **Library**.
-2. Cari **Google Drive API**, lalu klik **Enable**.
+1. Buka [Google Cloud Console](https://console.cloud.google.com/).
+2. Klik **Select a project** > **New Project**.
+3. Kasih nama project (misal: `gde-vault`), lalu buat.
+
+### 2. Aktifkan API yang Dibutuhkan
+
+1. Buka **APIs & Services** > **Library**.
+2. Cari dan aktifkan (**Enable**) API berikut satu per satu:
+   - **Google Drive API**
+   - **Google Docs API**
+   - **Google Sheets API**
+   - **Google Slides API**
+   - **Google Calendar API**
+3. Tunggu tiap API selesai aktif sebelum lanjut ke langkah berikutnya.
 
 ### 3. Konfigurasi OAuth Consent Screen
+
 1. Buka **APIs & Services** > **OAuth consent screen**.
-2. Pilih User Type **External** lalu klik **Create**.
-3. Isi kolom wajib (App name, User support email, Developer contact email).
-4. Di bagian **Scopes**, tambahkan scope:
-   - `https://www.googleapis.com/auth/drive`
+2. Di bagian **Branding**, isi kolom wajibnya (App name, User support email, Developer contact).
+3. Di bagian **Audience**, pilih **External** (atau **Internal** kalau kamu pakai akun Google Workspace). Terus tambahkan email Google yang mau dipakai login sebagai **test user**.
+4. Di bagian **Data Access**, tambahkan scope berikut (set yang direkomendasikan dokumentasi package-nya):
    - `https://www.googleapis.com/auth/drive.file`
-5. Di bagian **Test users**, tambahkan email Google yang mau dipakai login.
-6. Simpan konfigurasi.
+   - `https://www.googleapis.com/auth/documents`
+   - `https://www.googleapis.com/auth/spreadsheets`
+   - `https://www.googleapis.com/auth/presentations`
+   - `https://www.googleapis.com/auth/drive`
+   - `https://www.googleapis.com/auth/drive.readonly`
+   - `https://www.googleapis.com/auth/calendar`
+   - `https://www.googleapis.com/auth/calendar.events`
+5. Simpan konfigurasinya.
 
 ### 4. Bikin OAuth 2.0 Client ID
+
 1. Buka **APIs & Services** > **Credentials**.
 2. Klik **Create Credentials** > **OAuth client ID**.
-3. Pilih Application type: **Desktop app**.
-4. Beri nama (misal: `GDE Client`), lalu klik **Create**.
-5. Download file JSON kredensial tersebut.
+3. Pilih Application type: **Desktop app** (ini penting, jangan pilih tipe lain).
+4. Kasih nama (misal: `GDE Client`), lalu klik **Create**.
+5. Download file JSON kredensialnya.
+
+Cukup Client ID saja yang dibutuhkan, client secret nggak wajib. File JSON hasil download dipakai apa adanya, nggak perlu diedit.
 
 ### 5. Simpan Kredensial MCP
-Buat folder konfigurasi MCP dan salin file JSON yang tadi di-download dengan nama `gcp-oauth.keys.json`:
+
+Server nyari file bernama `gcp-oauth.keys.json`. Buat folder konfigurasinya, lalu salin file JSON yang tadi di-download dengan nama itu:
 
 ```bash
 mkdir -p ~/.config/google-drive-mcp
 cp /path/ke/credentials.json ~/.config/google-drive-mcp/gcp-oauth.keys.json
 ```
 
-Pastikan format isinya seperti ini:
-```json
-{
-  "installed": {
-    "client_id": "YOUR_CLIENT_ID.apps.googleusercontent.com",
-    "project_id": "your-project-id",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "client_secret": "YOUR_CLIENT_SECRET"
-  }
-}
-```
+Urutan lokasi yang dicek server (yang pertama ketemu langsung dipakai):
 
-### 6. Login & Otorisasi Akun
+1. Path di environment variable `GOOGLE_DRIVE_OAUTH_CREDENTIALS`, kalau diset.
+2. `~/.config/google-drive-mcp/gcp-oauth.keys.json` (lokasi yang direkomendasikan). Kalau `XDG_CONFIG_HOME` diset, dia menggantikan `~/.config`.
+3. Root project, sebagai fallback lama. Ini nggak bisa diandalkan kalau dijalankan lewat `npx`.
+
+Kalau file nggak ketemu di ketiga lokasi itu, server berhenti dengan pesan `OAuth credentials not found`.
+
+### 6. Login dan Otorisasi Akun
+
 Jalankan perintah ini di terminal:
 
 ```bash
-npx -y @piotr-agier/google-drive-mcp
+npx -y @piotr-agier/google-drive-mcp auth
 ```
-Browser bakal terbuka untuk konfirmasi izin akses Google Drive. Setelah disetujui, token otomatis tersimpan di `~/.config/google-drive-mcp/tokens.json`.
+
+Browser bakal terbuka buat konfirmasi izin akses Google Drive. Setelah disetujui, token otomatis tersimpan di `~/.config/google-drive-mcp/tokens.json`.
+
+> **Jangan commit** file kredensial (`gcp-oauth.keys.json`) maupun `tokens.json` ke repo mana pun.
 
 ---
 
 ## Instalasi GDE
 
-Clone repo dan jalankan skrip installernya:
+Clone repo, lalu jalankan skrip installernya:
 
 ```bash
 git clone https://github.com/ZanderoDev/gde.git
@@ -137,12 +155,14 @@ cd gde
 ```
 
 Skrip installer otomatis:
-- Mengecek Python 3 dan Node.js/npx.
-- Menginstall dependensi `cryptography`.
+
+- Ngecek Python 3 dan Node.js/npx.
+- Menginstal dependensi `cryptography`.
 - Memasang binary ke `~/.local/bin/gde` dan symlink `egd`.
 - Menjalankan crypto self-test.
 
-> Pastikan `~/.local/bin` sudah terdaftar di `$PATH`. Kalau belum, tambahkan ke `~/.bashrc` atau `~/.zshrc`:
+> Pastikan `~/.local/bin` udah ada di `$PATH`. Kalau belum, tambahkan ke `~/.bashrc` atau `~/.zshrc`:
+>
 > ```bash
 > export PATH="$HOME/.local/bin:$PATH"
 > ```
@@ -151,25 +171,31 @@ Skrip installer otomatis:
 
 ## Cara Pakai
 
-### Enkripsi & Upload File Tunggal
+### Enkripsi dan Upload File Tunggal
+
 ```bash
 gde dokumen.md
 gde database.sqlite
 ```
-File langsung dienkripsi raw bytes (tanpa ZIP), kuncinya masuk ke vault lokal, lalu di-upload ke GDrive sebagai `gde_<label>.enc`.
 
-### Enkripsi & Upload Folder
+File dienkripsi langsung dari raw bytes (tanpa ZIP), kuncinya masuk ke vault lokal, lalu di-upload ke GDrive sebagai `gde_<label>.enc`.
+
+### Enkripsi dan Upload Folder
+
 ```bash
 gde ~/Dokumen
 ```
+
 Folder otomatis di-pack ke ZIP secara rekursif, dienkripsi, lalu di-upload ke GDrive.
 
-### List File & Download Interaktif
+### List File dan Download Interaktif
+
 ```bash
 gde list
 ```
 
-Tampilan tabel:
+Tampilan tabelnya:
+
 ```text
 === DAFTAR FILE ENCRYPTED GOOGLE DRIVE (GDE) ===
 No   Nama                      Tipe     Ukuran       GDrive ID            Waktu
@@ -180,10 +206,13 @@ No   Nama                      Tipe     Ukuran       GDrive ID            Waktu
 
 Masukkan No file untuk download & restore (atau 'q' keluar): 2
 ```
-Tinggal ketik nomor filenya. GDE bakal download blob dari GDrive, ambil kunci dari vault lokal, verifikasi integritas, lalu ekstrak/tulis file aslinya ke direktori kerja saat ini.
+
+Tinggal ketik nomor filenya. GDE bakal download blob dari GDrive, ambil kunci dari vault lokal, verifikasi integritas, lalu ekstrak atau tulis file aslinya ke direktori kerja saat ini.
 
 ### Download Langsung (Non-interaktif)
-Bisa langsung panggil pakai Nomor ID atau Label:
+
+Bisa langsung dipanggil pakai nomor ID atau label:
+
 ```bash
 gde download 1
 # atau
@@ -191,16 +220,18 @@ gde download gde_febb82b998aa27ca
 ```
 
 ### Backup Berjadwal Otomatis (`--time` / `-t`)
-Jalankan backup otomatis secara berkala untuk folder atau file. GDE akan mengeksekusi siklus pertama segera, lalu otomatis mengulang proses backup sesuai interval waktu yang ditentukan.
 
-Format durasi waktu mendukung:
-- `s` : detik (seconds)
-- `m` : menit (minutes)
-- `h` : jam (hours)
-- `d` : hari (days)
-- `y` : tahun (years)
+Backup folder atau file secara berkala. GDE menjalankan siklus pertama langsung, lalu mengulanginya sesuai interval yang kamu tentukan.
 
-Bisa juga menggunakan kombinasi (misalnya `1d12h` atau `1h30m`).
+Format durasi yang didukung:
+
+- `s`: detik (seconds)
+- `m`: menit (minutes)
+- `h`: jam (hours)
+- `d`: hari (days)
+- `y`: tahun (years)
+
+Bisa juga dikombinasikan, misalnya `1d12h` atau `1h30m`.
 
 ```bash
 # Backup folder Dokumen ke Google Drive otomatis setiap 24 jam
@@ -218,24 +249,33 @@ gde --local ~/Dokumen -t 12h
 # Testing interval cepat (misal: setiap 30 detik)
 gde ~/Dokumen --time 30s
 ```
-> Tekan `Ctrl+C` kapan saja untuk menghentikan penjadwal backup.
+
+> Tekan `Ctrl+C` kapan aja buat menghentikan penjadwal backup.
 
 ### Mode Offline / Enkripsi Lokal Saja
+
 Kalau cuma mau enkripsi lokal tanpa upload ke GDrive:
+
 ```bash
 gde --local rahasia.txt
 ```
-File terenkripsi disimpan langsung di folder aktif sebagai `rahasia.txt.enc`.
+
+File terenkripsi disimpan di folder aktif sebagai `rahasia.txt.enc`.
 
 ### Dekripsi File Lokal
-Untuk mendekripsi kembali file `.enc` yang ada di mesin:
+
+Buat mendekripsi file `.enc` yang ada di mesinmu:
+
 ```bash
 gde decrypt rahasia.txt.enc
 ```
-GDE otomatis membaca label di header file, mengambil kunci yang cocok dari vault lokal, dan memulihkan file/folder aslinya.
 
-### Backup & Restore Kunci Vault
-Semua kunci tersimpan di database lokal `vault.db`. Anda bisa mengekspor daftar kunci ke file JSON cadangan (dibuat dengan izin ketat `chmod 600`):
+GDE otomatis baca label di header file, ambil kunci yang cocok dari vault lokal, lalu memulihkan file atau folder aslinya.
+
+### Backup dan Restore Kunci Vault
+
+Semua kunci disimpan di database lokal `vault.db`. Kamu bisa mengekspor daftar kunci ke file JSON cadangan (dibuat dengan permission ketat `chmod 600`):
+
 ```bash
 # Export semua kunci vault ke file JSON (disimpan atomic 0600)
 gde export-keys cadangan-kunci.json
@@ -243,12 +283,15 @@ gde export-keys cadangan-kunci.json
 # Import kunci dari file backup JSON ke mesin baru
 gde import-keys cadangan-kunci.json
 ```
-> **Catatan:** File export berisi kunci plaintext. Pastikan disimpan di media penyimpanan yang aman (misalnya drive terenkripsi/LUKS).
+
+> **Catatan:** file export berisi kunci plaintext. Simpan di media yang aman (misalnya drive terenkripsi/LUKS).
 
 ### Pengaturan Bahasa / Language Settings (`set-lang` & `--lang`)
+
 GDE mendukung dua bahasa: **Bahasa Indonesia (ID)** dan **English (EN)**.
 
-Saat pertama kali menjalankan `./install.sh`, installer akan menawarkan pilihan bahasa instalasi dan menyimpannya ke konfigurasi lokal. Anda juga bisa mengganti bahasa kapan saja:
+Pas pertama kali menjalankan `./install.sh`, installer nawarin pilihan bahasa dan menyimpannya ke konfigurasi lokal. Bahasanya bisa kamu ganti kapan aja:
+
 ```bash
 # Ubah bahasa tampilan default ke English
 gde set-lang en
@@ -262,10 +305,11 @@ gde --lang en list
 
 ### Integrasi AI Agent via MCP (Model Context Protocol)
 
-GDE punya server MCP bawaan berstandar JSON-RPC 2.0 via stdio (`gde mcp`). Ini memungkinkan asisten AI atau coding agent (Claude Desktop, Cursor, Antigravity, Cline, Windsurf) mengakses enkripsi, dekripsi, dan sinkronisasi Google Drive langsung sebagai **native tools**.
+GDE punya server MCP bawaan berstandar JSON-RPC 2.0 lewat stdio (`gde mcp`). Dengan ini, asisten AI atau coding agent (Claude Desktop, Cursor, Antigravity, Cline, Windsurf) bisa memakai enkripsi, dekripsi, dan sinkronisasi Google Drive langsung sebagai **native tools**.
 
 #### 1. Konfigurasi Claude Desktop (`claude_desktop_config.json`)
-Tambahkan blok ini ke file konfigurasi Claude Desktop kamu (`~/.config/Claude/claude_desktop_config.json` di Linux atau `~/Library/Application Support/Claude/claude_desktop_config.json` di macOS):
+
+Tambahkan blok ini ke file konfigurasi Claude Desktop (`~/.config/Claude/claude_desktop_config.json` di Linux, atau `~/Library/Application Support/Claude/claude_desktop_config.json` di macOS):
 
 ```json
 {
@@ -278,14 +322,16 @@ Tambahkan blok ini ke file konfigurasi Claude Desktop kamu (`~/.config/Claude/cl
 }
 ```
 
-> Bila binary `gde` berada di path khusus, tulis path lengkapnya, misalnya `"/home/username/.local/bin/gde"`.
+> Kalau binary `gde` ada di path khusus, tulis path lengkapnya, misalnya `"/home/username/.local/bin/gde"`.
 
 #### 2. Konfigurasi Cursor / Generic MCP Client
-Pada menu Settings > Features > MCP Servers di Cursor, buat konfigurasi baru:
+
+Di Cursor, buka Settings > Features > MCP Servers, lalu buat konfigurasi baru:
+
 - **Type**: `command`
 - **Command**: `gde mcp`
 
-#### 3. Daftar Tools yang Tersedia untuk AI Agent
+#### 3. Daftar Tools yang Tersedia buat AI Agent
 
 | Nama Tool | Deskripsi | Argumen Utama |
 |---|---|---|
@@ -297,7 +343,8 @@ Pada menu Settings > Features > MCP Servers di Cursor, buat konfigurasi baru:
 | `gde_export_keys` | Ekspor seluruh kunci vault ke file backup JSON (dibuat dengan permission ketat `0600`). | `out_path` (string, opsional) |
 | `gde_import_keys` | Impor kunci vault dari file backup JSON dengan validasi sanitasi path. | `in_path` (string, wajib) |
 
-Contoh prompt ke AI Agent:
+Contoh prompt ke AI agent:
+
 - *"Tolong amankan folder proyek ini pakai tool gde_encrypt dengan opsi local_only."*
 - *"Cek apakah ada file backup terbaru di vault dengan gde_list."*
 - *"Dekripsi file laporan.pdf.enc ke folder ./restored."*
@@ -306,22 +353,27 @@ Contoh prompt ke AI Agent:
 
 ### Opsi Tambahan
 
-#### 1. Penimpaan File Otomatis (`--force` / `-f`)
-Secara default, GDE meminta konfirmasi `[y/N]` sebelum menimpa file atau folder yang sudah ada di disk. Untuk eksekusi otomatis tanpa prompt (misal di script atau cron), sertakan flag `--force` atau `-f`:
+#### 1. Timpa File Otomatis (`--force` / `-f`)
+
+Secara default, GDE minta konfirmasi `[y/N]` sebelum menimpa file atau folder yang udah ada di disk. Buat eksekusi otomatis tanpa prompt (misal di script atau cron), tambahkan flag `--force` atau `-f`:
+
 ```bash
 gde download 1 --force
 gde decrypt dokumen.md.enc -f
 ```
 
-#### 2. Abaikan Berkas Tak Terbaca (`--allow-partial`)
-Jika sebuah folder berisi file atau subdirektori yang tidak bisa dibaca (misalnya izin `000` atau milik root), GDE akan menampilkan daftar file tersebut dan berhenti dengan **exit code 2** (agar script/cron tahu backup tidak 100% lengkap).
-Untuk tetap memproses dan mengabaikan entri yang tak terbaca (exit code 0):
+#### 2. Abaikan Berkas yang Nggak Terbaca (`--allow-partial`)
+
+Kalau sebuah folder berisi file atau subdirektori yang nggak bisa dibaca (misalnya permission `000` atau milik root), GDE menampilkan daftar file tersebut lalu berhenti dengan **exit code 2**, supaya script atau cron tahu backup-nya nggak 100% lengkap. Buat tetap memproses folder itu dan mengabaikan entri yang nggak terbaca (exit code 0):
+
 ```bash
 gde ~/Proyek --allow-partial
 ```
 
 ### Jalankan Self-Test
-Buat ngecek fungsi enkripsi, permission zip, dan deteksi tampering di sistem kamu:
+
+Buat ngecek fungsi enkripsi, permission zip, dan deteksi tampering di sistemmu:
+
 ```bash
 gde test
 ```
@@ -341,18 +393,21 @@ gde test
 
 ## Troubleshooting
 
-- **Error token revoked/expired:**
-  Jalankan ulang otorisasi akun:
+- **Error token revoked/expired:** jalankan ulang otorisasi akunnya:
+
   ```bash
   npx -y @piotr-agier/google-drive-mcp auth
   ```
-- **Command `gde` tidak ditemukan:**
-  Tambahkan path bin lokal ke konfigurasi shell:
+
+  Kalau OAuth consent screen-mu masih berstatus **Testing**, refresh token dari Google kedaluwarsa setelah 7 hari, jadi kamu perlu login ulang tiap seminggu. Di status **In production**, refresh token umumnya nggak kedaluwarsa kecuali di-revoke atau lama nggak dipakai.
+- **`OAuth credentials not found`:** file `gcp-oauth.keys.json` belum ada di lokasi yang dicek server. Cek lagi [langkah 5](#5-simpan-kredensial-mcp).
+- **Command `gde` nggak ketemu:** tambahkan path bin lokal ke konfigurasi shell:
+
   ```bash
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
   ```
-- **Error modul `cryptography`:**
-  Install modul via pip:
+- **Error modul `cryptography`:** install modulnya lewat pip:
+
   ```bash
   pip3 install --user cryptography
   ```

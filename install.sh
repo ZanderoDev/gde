@@ -181,7 +181,7 @@ if [ -f "$MCP_CONFIG_DIR/gcp-oauth.keys.json" ]; then
         echo -e "${GREEN}[+] $MSG_TOKEN_FOUND${RESET}"
     else
         echo -e "${YELLOW}[!] $MSG_TOKEN_MISSING${RESET}"
-        echo -e "    ${BOLD}npx -y @piotr-agier/google-drive-mcp${RESET}"
+        echo -e "    ${BOLD}npx -y @piotr-agier/google-drive-mcp auth${RESET}"
     fi
 else
     echo -e "${YELLOW}[!] $MSG_NO_GCP${RESET}"
