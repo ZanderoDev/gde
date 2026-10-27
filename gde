@@ -19,6 +19,7 @@ import threading
 import stat
 import warnings
 import re
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -68,6 +69,214 @@ MAGIC_EGD = b"EGD1"  # backwards compatibility
 DB_DIR = Path.home() / ".config" / "gde"
 LEGACY_DB = Path.home() / ".config" / "egd" / "vault.db"
 DB_PATH = DB_DIR / "vault.db"
+CONFIG_PATH = DB_DIR / "config.json"
+
+T = {
+    "id": {
+        "target_not_found": "Path '{target}' nggak ketemu.",
+        "stat_error": "Gagal cek target '{target}': {err}",
+        "special_file_err": "Target '{name}' berupa file khusus (FIFO/socket/device) dan nggak didukung.",
+        "invalid_target_type": "Target '{name}' bukan file reguler atau folder.",
+        "folder_label": "Folder",
+        "file_label": "File",
+        "target_info": "Target      : {name} ({type})",
+        "size_info": "Ukuran asli : {size:.2f} KB",
+        "label_info": "Label file  : {label}",
+        "compress_zip": "Target berupa folder -> Kompres ke ZIP...",
+        "special_files_skipped": "{count} file khusus (FIFO/socket/device) dilewati biar nggak hang.",
+        "unreadable_warn": "{count} file/folder nggak bisa dibaca karena masalah izin:",
+        "and_more_entries": "...dan {count} entri lainnya.",
+        "encrypt_single": "Target berupa file -> Enkripsi langsung tanpa ZIP...",
+        "encrypting_cipher": "Enkripsi pakai ChaCha20-Poly1305 (256-bit key unik)...",
+        "overwrite_prompt": "Target '{dest}' udah ada. Timpa? [y/N]: ",
+        "cancelled_by_user": "Dibatalkan oleh pengguna.",
+        "overwrite_noninteractive": "Target '{dest}' udah ada. Pakai flag --force buat nimpa di mode non-interaktif.",
+        "save_local_success": "File terenkripsi disimpan ke: {path}",
+        "key_saved_vault": "Kunci tersimpan di vault lokal: {path}",
+        "restore_local_hint": "Buat restore lokal: gde decrypt {name}",
+        "partial_backup_warn": "Selesai DENGAN PERINGATAN: Backup parsial ({count} entri dilewati).",
+        "allow_partial_hint": "Pakai flag --allow-partial kalau memang sengaja mau lewati entri yang bermasalah.",
+        "partial_backup_allowed": "Selesai: Backup parsial ({count} entri dilewati, --allow-partial aktif).",
+        "done_local": "Selesai: {name} terenkripsi lokal.",
+        "uploading_mcp": "Mengunggah ke Google Drive via MCP...",
+        "upload_success": "Upload berhasil. Drive ID: {id}",
+        "upload_failed_fallback": "Upload gagal. File terenkripsi diamankan ke: {path}",
+        "cloud_done": "Selesai: {name} terenkripsi penuh di cloud.",
+        "key_and_metadata_saved": "Kunci & metadata aman tersimpan di {path}",
+        "reading_enc": "Membaca file terenkripsi: {name}",
+        "enc_too_short": "Format file tidak valid (terlalu pendek).",
+        "not_gde_file": "Bukan file terenkripsi GDE/EGD.",
+        "detected_label": "Terdeteksi label: {label}",
+        "key_found_vault": "Kunci ditemukan di vault untuk file: {name}",
+        "key_not_found_vault": "Kunci buat label ini nggak ketemu di database vault lokal.",
+        "enter_hex_key": "Masukkan 64-karakter hex key (atau 'q' keluar): ",
+        "cancelled_or_closed": "Dibatalkan atau input ditutup.",
+        "key_length_err": "Panjang kunci harus 32 byte (64 hex characters)",
+        "invalid_key_err": "Kunci nggak valid: {err}",
+        "decrypt_invalid_tag": "Gagal dekripsi: Kunci salah atau data udah diubah/korup (InvalidTag)!",
+        "decrypt_err": "Gagal dekripsi: {err}",
+        "extracting_folder": "Mengekstrak folder ke: {dest}",
+        "writing_file_mode": "Menulis file ke: {dest} (mode 0600)",
+        "decrypt_success": "Berhasil didekripsi ke: {dest}",
+        "vault_empty": "Vault kosong. Belum ada file yang dienkripsi.",
+        "vault_list_title": "=== DAFTAR FILE ENCRYPTED GOOGLE DRIVE (GDE) ===",
+        "col_no": "No",
+        "col_name": "Nama",
+        "col_type": "Tipe",
+        "col_size": "Ukuran",
+        "col_gdrive": "GDrive ID",
+        "col_time": "Waktu",
+        "col_local": "Lokal",
+        "list_prompt": "Masukkan No file untuk download & restore (atau 'q' keluar): ",
+        "invalid_number_err": "Input nggak valid: Masukkan angka nomor file.",
+        "item_not_found": "Data '{item}' nggak ketemu di vault.",
+        "download_process": "Memproses download: {name} (Label: {label}, Tipe: {type})",
+        "downloading_mcp": "Mengunduh dari GDrive (ID: {id}) via MCP...",
+        "download_file_missing": "Gagal: File hasil download nggak ditemukan.",
+        "decrypting_with_key": "Mendekripsi file dengan kunci dari database lokal...",
+        "restore_success": "Berhasil di-restore ke: {dest}",
+        "export_done": "Vault berhasil di-export ke: {path} ({count} entri)",
+        "export_note": "CATATAN: File export berisi kunci plaintext (izin file diset ketat 0600). Simpan di media aman!",
+        "backup_file_missing": "File backup '{path}' nggak ketemu.",
+        "backup_read_failed": "Gagal membaca file backup JSON: {err}",
+        "backup_format_invalid": "Format backup JSON nggak valid: Root harus berupa array.",
+        "import_done": "Berhasil mengimpor {count} kunci baru ke vault.",
+        "import_rejected": "{count} entri nggak valid ditolak demi keamanan.",
+        "sched_active": "Mode Backup Berjadwal Aktif",
+        "sched_target": "Target      : {name} ({type})",
+        "sched_path": "Path        : {path}",
+        "sched_interval": "Interval    : {formatted} ({seconds} detik)",
+        "sched_storage": "Penyimpanan : {dest}",
+        "sched_ctrl_c": "Tekan Ctrl+C untuk menghentikan penjadwal.",
+        "sched_cycle_header": "Siklus Backup #{cycle}",
+        "sched_cycle_success": "Siklus #{cycle} selesai.",
+        "sched_cycle_warn": "Siklus #{cycle} selesai dengan peringatan (parsial).",
+        "sched_cycle_fail": "Siklus #{cycle} gagal diproses.",
+        "sched_waiting_next": "Menunggu siklus #{next_cycle}. Jadwal berikutnya: {next_time} (dalam {duration})",
+        "sched_stopped": "Penjadwal backup dihentikan oleh pengguna.",
+        "lang_changed": "Bahasa berhasil diubah ke: Bahasa Indonesia (ID)",
+        "lang_invalid": "Pilihan bahasa tidak valid: Gunakan 'id' atau 'en'.",
+    },
+    "en": {
+        "target_not_found": "Path '{target}' not found.",
+        "stat_error": "Failed to inspect target '{target}': {err}",
+        "special_file_err": "Target '{name}' is a special file (FIFO/socket/device) and is not supported.",
+        "invalid_target_type": "Target '{name}' is not a regular file or folder.",
+        "folder_label": "Folder",
+        "file_label": "File",
+        "target_info": "Target      : {name} ({type})",
+        "size_info": "Original size : {size:.2f} KB",
+        "label_info": "File label  : {label}",
+        "compress_zip": "Target is a folder -> Compressing to ZIP...",
+        "special_files_skipped": "{count} special files (FIFO/socket/device) skipped to prevent hanging.",
+        "unreadable_warn": "{count} files/folders cannot be read due to permission issues:",
+        "and_more_entries": "...and {count} other entries.",
+        "encrypt_single": "Target is a file -> Encrypting directly without ZIP...",
+        "encrypting_cipher": "Encrypting with ChaCha20-Poly1305 (256-bit unique key)...",
+        "overwrite_prompt": "Target '{dest}' already exists. Overwrite? [y/N]: ",
+        "cancelled_by_user": "Cancelled by user.",
+        "overwrite_noninteractive": "Target '{dest}' already exists. Use --force flag to overwrite in non-interactive mode.",
+        "save_local_success": "Encrypted file saved to: {path}",
+        "key_saved_vault": "Key saved in local vault: {path}",
+        "restore_local_hint": "To restore locally: gde decrypt {name}",
+        "partial_backup_warn": "Finished WITH WARNINGS: Partial backup ({count} entries skipped).",
+        "allow_partial_hint": "Use flag --allow-partial to intentionally bypass skipped entries.",
+        "partial_backup_allowed": "Finished: Partial backup ({count} entries skipped, --allow-partial active).",
+        "done_local": "Done: {name} locally encrypted.",
+        "uploading_mcp": "Uploading to Google Drive via MCP...",
+        "upload_success": "Upload successful. Drive ID: {id}",
+        "upload_failed_fallback": "Upload failed. Encrypted file safely stored locally at: {path}",
+        "cloud_done": "Done: {name} fully encrypted in cloud.",
+        "key_and_metadata_saved": "Keys & metadata safely stored in {path}",
+        "reading_enc": "Reading encrypted file: {name}",
+        "enc_too_short": "Invalid file format (too short).",
+        "not_gde_file": "Not a GDE/EGD encrypted file.",
+        "detected_label": "Detected label: {label}",
+        "key_found_vault": "Key found in vault for file: {name}",
+        "key_not_found_vault": "Key for this label was not found in the local vault database.",
+        "enter_hex_key": "Enter 64-character hex key (or 'q' to quit): ",
+        "cancelled_or_closed": "Cancelled or input closed.",
+        "key_length_err": "Key length must be 32 bytes (64 hex characters)",
+        "invalid_key_err": "Invalid key: {err}",
+        "decrypt_invalid_tag": "Decryption failed: Wrong key or data was corrupted/tampered (InvalidTag)!",
+        "decrypt_err": "Decryption failed: {err}",
+        "extracting_folder": "Extracting folder to: {dest}",
+        "writing_file_mode": "Writing file to: {dest} (mode 0600)",
+        "decrypt_success": "Successfully decrypted to: {dest}",
+        "vault_empty": "Vault is empty. No files encrypted yet.",
+        "vault_list_title": "=== GOOGLE DRIVE ENCRYPTED FILES (GDE) ===",
+        "col_no": "No",
+        "col_name": "Name",
+        "col_type": "Type",
+        "col_size": "Size",
+        "col_gdrive": "GDrive ID",
+        "col_time": "Time",
+        "col_local": "Local",
+        "list_prompt": "Enter file No to download & restore (or 'q' to quit): ",
+        "invalid_number_err": "Invalid input: Please enter a file number.",
+        "item_not_found": "Item '{item}' was not found in the vault.",
+        "download_process": "Processing download: {name} (Label: {label}, Type: {type})",
+        "downloading_mcp": "Downloading from GDrive (ID: {id}) via MCP...",
+        "download_file_missing": "Failed: Downloaded file not found.",
+        "decrypting_with_key": "Decrypting file using key from local database...",
+        "restore_success": "Successfully restored to: {dest}",
+        "export_done": "Vault successfully exported to: {path} ({count} entries)",
+        "export_note": "NOTE: Export file contains plaintext keys (file permissions set to 0600). Keep it secure!",
+        "backup_file_missing": "Backup file '{path}' not found.",
+        "backup_read_failed": "Failed to read JSON backup file: {err}",
+        "backup_format_invalid": "Invalid JSON backup format: Root must be an array.",
+        "import_done": "Successfully imported {count} new keys to vault.",
+        "import_rejected": "{count} invalid entries rejected for security.",
+        "sched_active": "Scheduled Backup Mode Active",
+        "sched_target": "Target      : {name} ({type})",
+        "sched_path": "Path        : {path}",
+        "sched_interval": "Interval    : {formatted} ({seconds} seconds)",
+        "sched_storage": "Storage     : {dest}",
+        "sched_ctrl_c": "Press Ctrl+C to stop the scheduler.",
+        "sched_cycle_header": "Backup Cycle #{cycle}",
+        "sched_cycle_success": "Cycle #{cycle} completed.",
+        "sched_cycle_warn": "Cycle #{cycle} completed with warnings (partial).",
+        "sched_cycle_fail": "Cycle #{cycle} failed to process.",
+        "sched_waiting_next": "Waiting for cycle #{next_cycle}. Next run: {next_time} (in {duration})",
+        "sched_stopped": "Scheduled backup stopped by user.",
+        "lang_changed": "Language successfully changed to: English (EN)",
+        "lang_invalid": "Invalid language choice: Use 'id' or 'en'.",
+    }
+}
+
+
+def get_saved_lang():
+    env_lang = os.environ.get("GDE_LANG", "").lower().strip()
+    if env_lang in ("id", "en"):
+        return env_lang
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                lang = data.get("lang", "").lower().strip()
+                if lang in ("id", "en"):
+                    return lang
+        except Exception:
+            pass
+    return "id"
+
+
+CURRENT_LANG = get_saved_lang()
+
+
+def set_current_lang(lang):
+    global CURRENT_LANG
+    lang_clean = lang.lower().strip()
+    if lang_clean in ("id", "en"):
+        CURRENT_LANG = lang_clean
+
+
+def t(key, **kwargs):
+    dic = T.get(CURRENT_LANG, T["id"])
+    pattern = dic.get(key) or T["id"].get(key, key)
+    if kwargs:
+        return pattern.format(**kwargs)
+    return pattern
 
 
 def init_db(custom_path=None):
@@ -131,6 +340,87 @@ def atomic_copy_file(src_path, dest_path, mode=0o600):
 
     # os.replace unlinks the old directory entry and links the new inode, breaking any hard links safely
     os.replace(tmp_path, dest)
+
+
+def parse_duration(time_str: str) -> int:
+    """
+    Parse a duration string into total seconds.
+    Supports units:
+      s: detik (seconds)
+      m: menit (minutes)
+      h: jam (hours)
+      d: hari (days)
+      y: tahun (years, 365 days)
+    Supports single or compound expressions (e.g. '30s', '24h', '7d', '1y', '1d12h').
+    """
+    s = time_str.strip().lower()
+    if not s:
+        raise ValueError("Durasi waktu (--time) tidak boleh kosong.")
+
+    units = {
+        "s": 1,
+        "m": 60,
+        "h": 3600,
+        "d": 86400,
+        "y": 365 * 86400,
+    }
+
+    matches = re.findall(r"(\d+)\s*([smhdy])", s)
+    if not matches:
+        raise ValueError(
+            f"Format durasi waktu '{time_str}' tidak valid. Gunakan format seperti: 30s, 10m, 24h, 7d, 1y"
+        )
+
+    consumed = "".join(f"{num}{unit}" for num, unit in matches)
+    cleaned = re.sub(r"\s+", "", s)
+    if consumed != cleaned:
+        raise ValueError(
+            f"Format durasi waktu '{time_str}' tidak valid. Satuan yang didukung: s (detik), m (menit), h (jam), d (hari), y (tahun)."
+        )
+
+    total_seconds = sum(int(num) * units[unit] for num, unit in matches)
+    if total_seconds <= 0:
+        raise ValueError("Durasi waktu (--time) harus lebih besar dari 0.")
+
+    return total_seconds
+
+
+def format_duration(seconds: int, lang=None) -> str:
+    """Format total seconds into a readable string (e.g. '24 jam' or '24 hours')."""
+    l = lang or CURRENT_LANG
+    if seconds < 60:
+        return f"{seconds} detik" if l == "id" else f"{seconds} seconds"
+    parts = []
+    years, rem = divmod(seconds, 365 * 86400)
+    days, rem = divmod(rem, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, sec = divmod(rem, 60)
+
+    if l == "id":
+        if years:
+            parts.append(f"{years} tahun")
+        if days:
+            parts.append(f"{days} hari")
+        if hours:
+            parts.append(f"{hours} jam")
+        if minutes:
+            parts.append(f"{minutes} menit")
+        if sec:
+            parts.append(f"{sec} detik")
+    else:
+        if years:
+            parts.append(f"{years} year" if years == 1 else f"{years} years")
+        if days:
+            parts.append(f"{days} day" if days == 1 else f"{days} days")
+        if hours:
+            parts.append(f"{hours} hour" if hours == 1 else f"{hours} hours")
+        if minutes:
+            parts.append(f"{minutes} minute" if minutes == 1 else f"{minutes} minutes")
+        if sec:
+            parts.append(f"{sec} second" if sec == 1 else f"{sec} seconds")
+
+    fallback = f"{seconds} detik" if l == "id" else f"{seconds} seconds"
+    return " ".join(parts) if parts else fallback
 
 
 class GDriveMCP:
@@ -483,35 +773,43 @@ def confirm_overwrite(dest_path, force=False):
         return True
 
     if not sys.stdin.isatty():
-        log_err(f"Target '{dest_path}' sudah ada. Gunakan flag --force untuk menimpa dalam mode non-interaktif.")
+        log_err(t("overwrite_noninteractive", dest=dest_path))
         return False
 
-    prompt = f"{C.YELLOW}[!]{C.RESET} Target '{C.BOLD}{dest_path}{C.RESET}' sudah ada. Timpa? [y/N]: "
+    prompt = f"{C.YELLOW}[!]{C.RESET} {t('overwrite_prompt', dest=f'{C.BOLD}{dest_path}{C.RESET}')}"
     ans = input(prompt).strip().lower()
     return ans in ("y", "yes")
 
 
-def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
+def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False, exit_on_error=True):
     target = Path(path_str).expanduser().resolve()
     if not target.exists() and not os.path.islink(target):
-        log_err(f"Path '{target}' tidak ditemukan.")
-        sys.exit(1)
+        log_err(t("target_not_found", target=target))
+        if exit_on_error:
+            sys.exit(1)
+        return 1
 
     try:
         st = os.lstat(target)
     except OSError as e:
-        log_err(f"Gagal memeriksa target '{target}': {e}")
-        sys.exit(1)
+        log_err(t("stat_error", target=target, err=e))
+        if exit_on_error:
+            sys.exit(1)
+        return 1
 
     # Bug #3: Tolak file khusus (FIFO/socket/device) pada input langsung
     if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
-        log_err(f"Target '{target.name}' adalah file khusus (FIFO/socket/device) dan tidak didukung.")
-        sys.exit(1)
+        log_err(t("special_file_err", name=target.name))
+        if exit_on_error:
+            sys.exit(1)
+        return 1
 
     is_dir = 1 if stat.S_ISDIR(st.st_mode) and not os.path.islink(target) else 0
     if not is_dir and not stat.S_ISREG(st.st_mode) and not os.path.islink(target):
-        log_err(f"Target '{target.name}' bukan file reguler atau direktori.")
-        sys.exit(1)
+        log_err(t("invalid_target_type", name=target.name))
+        if exit_on_error:
+            sys.exit(1)
+        return 1
 
     conn = init_db()
     label = f"gde_{secrets.token_hex(8)}"
@@ -521,9 +819,10 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
     else:
         size_bytes = target.stat().st_size if not os.path.islink(target) else 0
 
-    log_info(f"Target      : {C.BOLD}{target.name}{C.RESET} ({C.MAGENTA + 'Folder' if is_dir else C.CYAN + 'File'}{C.RESET})")
-    log_info(f"Ukuran asli : {C.YELLOW}{size_bytes / 1024:.2f} KB{C.RESET}")
-    log_info(f"Label file  : {C.GREEN}{label}{C.RESET}")
+    type_name = C.MAGENTA + t("folder_label") if is_dir else C.CYAN + t("file_label")
+    log_info(t("target_info", name=f"{C.BOLD}{target.name}{C.RESET}", type=f"{type_name}{C.RESET}"))
+    log_info(t("size_info", size=size_bytes / 1024))
+    log_info(t("label_info", label=f"{C.GREEN}{label}{C.RESET}"))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -532,27 +831,27 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
         special_files = []
 
         if is_dir:
-            log_info(f"Target adalah {C.MAGENTA}folder{C.RESET} -> Kompres ke ZIP...")
+            log_info(t("compress_zip"))
             zip_path = tmp / "data.zip"
             unreadable_items, special_files = compress_directory(target, zip_path)
 
             if special_files:
-                log_warn(f"{len(special_files)} file khusus (FIFO/socket/device) dilewati untuk mencegah hang.")
+                log_warn(t("special_files_skipped", count=len(special_files)))
             if unreadable_items:
-                log_warn(f"{len(unreadable_items)} file/direktori tidak dapat dibaca karena masalah izin:")
+                log_warn(t("unreadable_warn", count=len(unreadable_items)))
                 for upath, uerr in unreadable_items[:5]:
                     print(f"    {C.GRAY}• {upath}: {uerr}{C.RESET}")
                 if len(unreadable_items) > 5:
-                    print(f"    {C.GRAY}...dan {len(unreadable_items) - 5} entri lainnya.{C.RESET}")
+                    print(f"    {C.GRAY}{t('and_more_entries', count=len(unreadable_items) - 5)}{C.RESET}")
 
             with open(zip_path, "rb") as f:
                 raw_bytes = f.read()
         else:
-            log_info(f"Target adalah {C.CYAN}file{C.RESET} -> Enkripsi langsung {C.BOLD}tanpa ZIP{C.RESET}...")
+            log_info(t("encrypt_single"))
             with open(target, "rb") as f:
                 raw_bytes = f.read()
 
-        log_info("Mengenkripsi dengan ChaCha20-Poly1305 (256-bit key unik)...")
+        log_info(t("encrypting_cipher"))
         enc_bytes, key = encrypt_data(raw_bytes, label)
         with open(temp_enc, "wb") as f:
             f.write(enc_bytes)
@@ -562,8 +861,10 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
         if local_only:
             out_enc = Path.cwd() / f"{target.name}.enc"
             if not confirm_overwrite(out_enc, force=force):
-                log_warn("Dibatalkan oleh pengguna.")
-                sys.exit(1)
+                log_warn(t("cancelled_by_user"))
+                if exit_on_error:
+                    sys.exit(1)
+                return 1
 
             # Simpan kunci ke DB lokal TERLEBIH DAHULU sebelum menyalin file keluar
             conn.execute(
@@ -579,23 +880,27 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
             except Exception as e:
                 conn.execute("DELETE FROM vault WHERE label = ?", (label,))
                 conn.commit()
-                log_err(f"Gagal menyimpan ciphertext ke {out_enc}: {e}")
-                sys.exit(1)
+                log_err(f"{t('save_local_success', path=out_enc)}: {e}")
+                if exit_on_error:
+                    sys.exit(1)
+                return 1
 
-            log_success(f"File terenkripsi disimpan ke: {C.BOLD}{C.GREEN}{out_enc}{C.RESET}")
-            log_success(f"Kunci tersimpan di vault lokal: {C.DIM}{DB_PATH}{C.RESET}")
-            log_info(f"Untuk restore lokal: {C.GREEN}gde decrypt {out_enc.name}{C.RESET}")
+            log_success(t("save_local_success", path=f"{C.BOLD}{C.GREEN}{out_enc}{C.RESET}"))
+            log_success(t("key_saved_vault", path=f"{C.DIM}{DB_PATH}{C.RESET}"))
+            log_info(t("restore_local_hint", name=f"{C.GREEN}{out_enc.name}{C.RESET}"))
 
             skipped_items = len(unreadable_items) + len(special_files)
             if skipped_items and not allow_partial:
-                log_warn(f"Selesai DENGAN PERINGATAN: Backup parsial ({skipped_items} entri dilewati).")
-                log_info(f"Gunakan flag {C.YELLOW}--allow-partial{C.RESET} jika sengaja ingin mengabaikan entri yang dilewati.")
-                sys.exit(2)
+                log_warn(t("partial_backup_warn", count=skipped_items))
+                log_info(t("allow_partial_hint"))
+                if exit_on_error:
+                    sys.exit(2)
+                return 2
             elif skipped_items:
-                log_warn(f"Selesai: Backup parsial ({skipped_items} entri dilewati, --allow-partial aktif).")
+                log_warn(t("partial_backup_allowed", count=skipped_items))
             else:
-                log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi lokal.")
-            return
+                log_done(t("done_local", name=f"{C.BOLD}{target.name}{C.RESET}"))
+            return 0
 
         # Mode online: Simpan dulu kunci ke vault SEBELUM upload ke jaringan
         conn.execute(
@@ -605,14 +910,14 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
         )
         conn.commit()
 
-        log_info("Mengunggah ke Google Drive via MCP...")
+        log_info(t("uploading_mcp"))
         mcp = GDriveMCP()
         drive_file_id = None
         upload_err = None
         try:
             mcp.start()
             drive_file_id = mcp.upload_file(temp_enc, f"{label}.enc")
-            log_success(f"Berhasil upload. Drive ID: {C.GREEN}{drive_file_id}{C.RESET}")
+            log_success(t("upload_success", id=f"{C.GREEN}{drive_file_id}{C.RESET}"))
             conn.execute("UPDATE vault SET drive_file_id = ? WHERE label = ?", (drive_file_id, label))
             conn.commit()
         except Exception as e:
@@ -627,46 +932,113 @@ def cmd_encrypt(path_str, local_only=False, force=False, allow_partial=False):
 
             atomic_copy_file(temp_enc, fallback_enc, mode=0o644)
             log_err(f"GDrive MCP Error: {upload_err}")
-            log_warn(f"Upload gagal. File terenkripsi diamankan ke: {C.BOLD}{fallback_enc}{C.RESET}")
-            log_info(f"Kunci sudah tersimpan di vault. Untuk restore: {C.GREEN}gde decrypt {fallback_enc.name}{C.RESET}")
-            sys.exit(1)
+            log_warn(t("upload_failed_fallback", path=f"{C.BOLD}{fallback_enc}{C.RESET}"))
+            log_info(t("restore_local_hint", name=f"{C.GREEN}{fallback_enc.name}{C.RESET}"))
+            if exit_on_error:
+                sys.exit(1)
+            return 1
 
-        log_success(f"Kunci & metadata aman tersimpan di {C.DIM}{DB_PATH}{C.RESET}")
+        log_success(t("key_and_metadata_saved", path=f"{C.DIM}{DB_PATH}{C.RESET}"))
 
         skipped_items = len(unreadable_items) + len(special_files)
         if skipped_items and not allow_partial:
-            log_warn(f"Selesai DENGAN PERINGATAN: Backup cloud parsial ({skipped_items} entri dilewati).")
-            log_info(f"Gunakan flag {C.YELLOW}--allow-partial{C.RESET} jika sengaja ingin mengabaikan entri yang dilewati.")
-            sys.exit(2)
+            log_warn(t("partial_backup_warn", count=skipped_items))
+            log_info(t("allow_partial_hint"))
+            if exit_on_error:
+                sys.exit(2)
+            return 2
         elif skipped_items:
-            log_warn(f"Selesai: Backup cloud parsial ({skipped_items} entri dilewati, --allow-partial aktif).")
+            log_warn(t("partial_backup_allowed", count=skipped_items))
         else:
-            log_done(f"Selesai: {C.BOLD}{target.name}{C.RESET} terenkripsi penuh di cloud.")
+            log_done(t("cloud_done", name=f"{C.BOLD}{target.name}{C.RESET}"))
+        return 0
+
+
+def run_scheduled_backup(path_str, interval_seconds, local_only=False, force=False, allow_partial=False):
+    """Run periodic scheduled backup for a file or directory at specified interval."""
+    target = Path(path_str).expanduser().resolve()
+    if not target.exists() and not os.path.islink(target):
+        log_err(t("target_not_found", target=target))
+        sys.exit(1)
+
+    is_dir = target.is_dir() and not os.path.islink(target)
+    dest_type = "Lokal" if (local_only and CURRENT_LANG == "id") else "Local" if local_only else "Google Drive (MCP)"
+    type_str = t("folder_label") if is_dir else t("file_label")
+
+    log_info(f"{C.BOLD}{t('sched_active')}{C.RESET}")
+    log_info(t("sched_target", name=f"{C.BOLD}{target.name}{C.RESET}", type=f"{C.MAGENTA if is_dir else C.CYAN}{type_str}{C.RESET}"))
+    log_info(t("sched_path", path=f"{C.DIM}{target}{C.RESET}"))
+    log_info(t("sched_interval", formatted=f"{C.YELLOW}{format_duration(interval_seconds)}{C.RESET}", seconds=interval_seconds))
+    log_info(t("sched_storage", dest=f"{C.GREEN if not local_only else C.YELLOW}{dest_type}{C.RESET}"))
+    log_info(t("sched_ctrl_c"))
+
+    cycle = 1
+    effective_force = True if force or not sys.stdin.isatty() else force
+
+    while True:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        header_text = f"{t('sched_cycle_header', cycle=cycle)} — {now_str}"
+        print(f"\n{C.CYAN}╔═════════════════════════════════════════════════════════════╗{C.RESET}")
+        print(f"{C.CYAN}║  {C.BOLD}{header_text:<57}{C.RESET}{C.CYAN}║{C.RESET}")
+        print(f"{C.CYAN}╚═════════════════════════════════════════════════════════════╝{C.RESET}")
+
+        try:
+            ret = cmd_encrypt(
+                path_str,
+                local_only=local_only,
+                force=effective_force,
+                allow_partial=allow_partial,
+                exit_on_error=False
+            )
+            if ret == 0:
+                log_success(t("sched_cycle_success", cycle=cycle))
+            elif ret == 2:
+                log_warn(t("sched_cycle_warn", cycle=cycle))
+            else:
+                log_err(t("sched_cycle_fail", cycle=cycle))
+        except Exception as e:
+            log_err(f"Cycle #{cycle} error: {e}")
+
+        # In scheduled mode, subsequent local backups force overwrite to avoid hanging on prompt
+        effective_force = True
+
+        next_time = datetime.fromtimestamp(datetime.now().timestamp() + interval_seconds)
+        next_time_str = next_time.strftime("%Y-%m-%d %H:%M:%S")
+        waiting_msg = t("sched_waiting_next", next_cycle=cycle + 1, next_time=f"{C.BOLD}{C.GREEN}{next_time_str}{C.RESET}{C.GRAY}", duration=format_duration(interval_seconds))
+        print(f"\n{C.GRAY}[*] {waiting_msg}{C.RESET}")
+        print(f"{C.GRAY}[*] {t('sched_ctrl_c')}{C.RESET}\n")
+
+        cycle += 1
+        try:
+            time.sleep(interval_seconds)
+        except KeyboardInterrupt:
+            print(f"\n{C.YELLOW}[!]{C.RESET} {t('sched_stopped')}")
+            sys.exit(0)
 
 
 def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None):
     """Decrypt a local .enc file using the key from local vault or user input."""
     enc_path = Path(enc_path_str).expanduser().resolve()
     if not enc_path.exists():
-        log_err(f"File terenkripsi '{enc_path}' tidak ditemukan.")
+        log_err(t("target_not_found", target=enc_path))
         sys.exit(1)
 
-    log_info(f"Membaca file terenkripsi: {C.BOLD}{enc_path.name}{C.RESET}")
+    log_info(t("reading_enc", name=f"{C.BOLD}{enc_path.name}{C.RESET}"))
     with open(enc_path, "rb") as f:
         enc_data = f.read()
 
     if len(enc_data) < 5:
-        log_err("Format file tidak valid (terlalu pendek).")
+        log_err(t("enc_too_short"))
         sys.exit(1)
 
     magic = enc_data[:4]
     if magic not in (MAGIC_GDE, MAGIC_EGD):
-        log_err("Bukan file terenkripsi GDE/EGD.")
+        log_err(t("not_gde_file"))
         sys.exit(1)
 
     label_len = enc_data[4]
     label = enc_data[5:5 + label_len].decode("utf-8", errors="ignore")
-    log_info(f"Terdeteksi label: {C.GREEN}{label}{C.RESET}")
+    log_info(t("detected_label", label=f"{C.GREEN}{label}{C.RESET}"))
 
     conn = conn_override or init_db()
     cur = conn.cursor()
@@ -676,13 +1048,13 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
     if row:
         name, is_dir, key_hex = row
         key = bytes.fromhex(key_hex)
-        log_info(f"Kunci ditemukan di vault untuk file: {C.BOLD}{name}{C.RESET}")
+        log_info(t("key_found_vault", name=f"{C.BOLD}{name}{C.RESET}"))
     else:
-        log_warn("Kunci untuk label ini tidak ditemukan di database vault lokal.")
+        log_warn(t("key_not_found_vault"))
         try:
-            key_input = input(f"{C.CYAN}Masukkan 64-karakter hex key (atau 'q' keluar): {C.RESET}").strip()
+            key_input = input(f"{C.CYAN}{t('enter_hex_key')}{C.RESET}").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nDibatalkan atau stream input ditutup.")
+            print(f"\n{t('cancelled_or_closed')}")
             sys.exit(1)
 
         if not key_input or key_input.lower() == "q":
@@ -690,9 +1062,9 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
         try:
             key = bytes.fromhex(key_input)
             if len(key) != 32:
-                raise ValueError("Panjang kunci harus 32 byte (64 hex characters)")
+                raise ValueError(t("key_length_err"))
         except ValueError as ve:
-            log_err(f"Kunci tidak valid: {ve}")
+            log_err(t("invalid_key_err", err=ve))
             sys.exit(1)
         name = enc_path.stem
         is_dir = 0
@@ -702,10 +1074,10 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
         if extracted_label != label:
             raise ValueError("Label mismatch tag")
     except InvalidTag:
-        log_err("Gagal dekripsi: Kunci salah atau data telah diubah/korup (InvalidTag)!")
+        log_err(t("decrypt_invalid_tag"))
         sys.exit(1)
     except Exception as e:
-        log_err(f"Gagal dekripsi: {e}")
+        log_err(t("decrypt_err", err=e))
         sys.exit(1)
 
     # Sanitasi ketat nama file (cegah path traversal)
@@ -718,16 +1090,16 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
 
     # Validasi bahwa parent target berada di dalam base_dest_dir
     if not is_subpath(dest.parent, base_dest_dir):
-        log_err(f"Path traversal terdeteksi pada target pemulihan: {dest}")
+        log_err(f"Path traversal detected: {dest}")
         sys.exit(1)
 
     if not confirm_overwrite(dest, force=force):
-        log_warn("Dibatalkan oleh pengguna.")
+        log_warn(t("cancelled_by_user"))
         sys.exit(1)
 
     # Hapus symlink lama pada lokasi tujuan sebelum menulis
     if os.path.islink(dest):
-        log_warn(f"Target '{dest.name}' adalah symlink yang sudah ada. Menghapus symlink sebelum memulihkan...")
+        log_warn(f"Target '{dest.name}' is an existing symlink. Removing before restoring...")
         dest.unlink()
 
     if is_dir:
@@ -735,7 +1107,7 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_zip = Path(tmpdir) / "restored.zip"
             tmp_zip.write_bytes(dec_bytes)
-            log_info(f"Mengekstrak folder ke: {C.BOLD}{dest}{C.RESET}")
+            log_info(t("extracting_folder", dest=f"{C.BOLD}{dest}{C.RESET}"))
             extract_zip_faithful(tmp_zip, dest)
     else:
         # Tulis secara atomik dengan izin ketat 0600 (memutus hardlink lama secara aman)
@@ -755,9 +1127,9 @@ def cmd_decrypt_file(enc_path_str, dest_dir=".", force=False, conn_override=None
                     tmp_file.unlink()
                 except OSError:
                     pass
-        log_info(f"Menulis file ke: {C.BOLD}{dest}{C.RESET} (mode 0600)")
+        log_info(t("writing_file_mode", dest=f"{C.BOLD}{dest}{C.RESET}"))
 
-    log_done(f"Berhasil didekripsi ke: {C.BOLD}{C.GREEN}{dest}{C.RESET}")
+    log_done(t("decrypt_success", dest=f"{C.BOLD}{C.GREEN}{dest}{C.RESET}"))
 
 
 def cmd_list():
@@ -767,22 +1139,22 @@ def cmd_list():
     rows = cur.fetchall()
 
     if not rows:
-        print(f"\n{C.YELLOW}[!]{C.RESET} Vault kosong. Belum ada file yang dienkripsi.\n")
+        print(f"\n{C.YELLOW}[!]{C.RESET} {t('vault_empty')}\n")
         return
 
-    print(f"\n{C.BOLD}{C.CYAN}=== DAFTAR FILE ENCRYPTED GOOGLE DRIVE (GDE) ==={C.RESET}")
-    print(f"{C.BOLD}{'No':<4} {'Nama':<25} {'Tipe':<8} {'Ukuran':<12} {'GDrive ID':<20} {'Waktu'}{C.RESET}")
+    print(f"\n{C.BOLD}{C.CYAN}{t('vault_list_title')}{C.RESET}")
+    print(f"{C.BOLD}{t('col_no'):<4} {t('col_name'):<25} {t('col_type'):<8} {t('col_size'):<12} {t('col_gdrive'):<20} {t('col_time')}{C.RESET}")
     print(f"{C.GRAY}{'-' * 85}{C.RESET}")
     for r in rows:
         fid, label, name, is_dir, size, drive_id, created = r
-        raw_tipe = "Folder" if is_dir else "File"
+        raw_tipe = t("folder_label") if is_dir else t("file_label")
         tipe_color = C.MAGENTA if is_dir else C.CYAN
         tipe_fmt = f"{tipe_color}{raw_tipe:<8}{C.RESET}"
 
         sz = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):.2f} MB"
         sz_fmt = f"{C.BLUE}{sz:<12}{C.RESET}"
 
-        raw_did = (drive_id[:17] + "...") if drive_id and len(drive_id) > 20 else (drive_id or "Lokal")
+        raw_did = (drive_id[:17] + "...") if drive_id and len(drive_id) > 20 else (drive_id or t("col_local"))
         did_color = C.GREEN if drive_id else C.YELLOW
         did_fmt = f"{did_color}{raw_did:<20}{C.RESET}"
 
@@ -793,15 +1165,15 @@ def cmd_list():
     print(f"{C.GRAY}{'-' * 85}{C.RESET}")
 
     try:
-        pilihan = input(f"\n{C.BOLD}{C.CYAN}Masukkan No file untuk download & restore{C.RESET} ({C.YELLOW}atau 'q' keluar{C.RESET}): ").strip()
+        pilihan = input(f"\n{C.BOLD}{C.CYAN}{t('list_prompt')}{C.RESET}").strip()
         if not pilihan or pilihan.lower() == "q":
             return
         item_id = int(pilihan)
     except KeyboardInterrupt:
-        print("\nDibatalkan.")
+        print(f"\n{t('cancelled_by_user')}")
         return
     except ValueError:
-        log_err("Input tidak valid: Masukkan angka nomor file.")
+        log_err(t("invalid_number_err"))
         return
 
     cmd_download(item_id)
@@ -817,7 +1189,7 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None
 
     row = cur.fetchone()
     if not row:
-        log_err(f"Data '{item_id_or_label}' tidak ditemukan di vault.")
+        log_err(t("item_not_found", item=item_id_or_label))
         sys.exit(1)
 
     _, label, name, original_path, is_dir, key_hex, drive_file_id = row
@@ -830,10 +1202,11 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None
     base_dest_dir = Path(dest_dir).resolve()
     dest = base_dest_dir / safe_name
     if not is_subpath(dest.parent, base_dest_dir):
-        log_err(f"Path traversal terdeteksi pada target pemulihan: {dest}")
+        log_err(f"Path traversal detected: {dest}")
         sys.exit(1)
 
-    log_info(f"Memproses download: {C.BOLD}{safe_name}{C.RESET} (Label: {C.GREEN}{label}{C.RESET}, Tipe: {C.MAGENTA + 'Folder' if is_dir else C.CYAN + 'File'}{C.RESET})")
+    type_str = t("folder_label") if is_dir else t("file_label")
+    log_info(t("download_process", name=f"{C.BOLD}{safe_name}{C.RESET}", label=f"{C.GREEN}{label}{C.RESET}", type=f"{C.MAGENTA if is_dir else C.CYAN}{type_str}{C.RESET}"))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -851,14 +1224,13 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None
                     found = cand
                     break
             if found:
-                log_info(f"Menggunakan ciphertext lokal: {C.BOLD}{found}{C.RESET}")
                 enc_file = found
             else:
                 log_err("Item ini tersimpan lokal (tanpa ID GDrive) dan file .enc tidak ditemukan di folder saat ini.")
-                log_info(f"Jalankan: {C.GREEN}gde decrypt <path/ke/{safe_name}.enc>{C.RESET}")
+                log_info(f"gde decrypt <path/ke/{safe_name}.enc>")
                 sys.exit(1)
         else:
-            log_info(f"Mengunduh dari GDrive (ID: {C.GREEN}{drive_file_id}{C.RESET}) via MCP...")
+            log_info(t("downloading_mcp", id=f"{C.GREEN}{drive_file_id}{C.RESET}"))
             mcp = GDriveMCP()
             try:
                 mcp.start()
@@ -867,10 +1239,10 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None
                 mcp.close()
 
         if not enc_file.exists():
-            log_err("Gagal: File hasil download tidak ditemukan.")
+            log_err(t("download_file_missing"))
             sys.exit(1)
 
-        log_info("Mendekripsi file dengan kunci dari database lokal...")
+        log_info(t("decrypting_with_key"))
         with open(enc_file, "rb") as f:
             enc_data = f.read()
 
@@ -879,18 +1251,18 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None
             if extracted_label != label:
                 raise ValueError("Mismatch label tag")
         except InvalidTag:
-            log_err("Gagal dekripsi: Tag otentikasi tidak valid (data korup atau kunci salah)!")
+            log_err(t("decrypt_invalid_tag"))
             sys.exit(1)
         except Exception as e:
-            log_err(f"Gagal dekripsi: {e}")
+            log_err(t("decrypt_err", err=e))
             sys.exit(1)
 
         if not confirm_overwrite(dest, force=force):
-            log_warn("Dibatalkan oleh pengguna.")
+            log_warn(t("cancelled_by_user"))
             sys.exit(1)
 
         if os.path.islink(dest):
-            log_warn(f"Target '{dest.name}' adalah symlink yang sudah ada. Menghapus symlink sebelum memulihkan...")
+            log_warn(f"Target '{dest.name}' is an existing symlink. Removing before restoring...")
             dest.unlink()
 
         if is_dir:
@@ -916,9 +1288,9 @@ def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None
                         tmp_file.unlink()
                     except OSError:
                         pass
-            log_info(f"Menulis file ke: {C.BOLD}{dest}{C.RESET} (mode 0600)")
+            log_info(t("writing_file_mode", dest=f"{C.BOLD}{dest}{C.RESET}"))
 
-        log_done(f"Berhasil di-restore ke: {C.BOLD}{C.GREEN}{dest}{C.RESET}")
+        log_done(t("restore_success", dest=f"{C.BOLD}{C.GREEN}{dest}{C.RESET}"))
 
 
 def cmd_export_keys(out_path=None, conn_override=None):
@@ -972,26 +1344,26 @@ def cmd_export_keys(out_path=None, conn_override=None):
             except OSError:
                 pass
 
-    log_done(f"Vault berhasil di-export ke: {C.BOLD}{C.GREEN}{target_path}{C.RESET} ({len(data)} entri)")
-    log_warn("CATATAN: File export berisi kunci plaintext (izin file diset ketat 0600). Simpan di media aman!")
+    log_done(t("export_done", path=f"{C.BOLD}{C.GREEN}{target_path}{C.RESET}", count=len(data)))
+    log_warn(t("export_note"))
 
 
 def cmd_import_keys(in_path, conn_override=None):
     """Import keys from a backup JSON file with strict schema & path validation."""
     path = Path(in_path).expanduser().resolve()
     if not path.exists():
-        log_err(f"File backup '{path}' tidak ditemukan.")
+        log_err(t("backup_file_missing", path=path))
         sys.exit(1)
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        log_err(f"Gagal membaca file backup JSON: {e}")
+        log_err(t("backup_read_failed", err=e))
         sys.exit(1)
 
     if not isinstance(data, list):
-        log_err("Format backup JSON tidak valid: Root harus berupa array.")
+        log_err(t("backup_format_invalid"))
         sys.exit(1)
 
     conn = conn_override or init_db()
@@ -1037,9 +1409,37 @@ def cmd_import_keys(in_path, conn_override=None):
             count += 1
 
     conn.commit()
-    log_done(f"Berhasil mengimpor {C.BOLD}{count}{C.RESET} kunci baru ke vault.")
+    log_done(t("import_done", count=f"{C.BOLD}{count}{C.RESET}"))
     if rejected:
-        log_warn(f"{rejected} entri tidak valid ditolak demi keamanan.")
+        log_warn(t("import_rejected", count=rejected))
+
+
+def cmd_set_lang(lang_code):
+    """Set default interface language ('id' or 'en') and persist to config.json."""
+    lang = lang_code.lower().strip()
+    if lang not in ("id", "en"):
+        log_err(t("lang_invalid"))
+        sys.exit(1)
+
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+
+    cfg["lang"] = lang
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+    set_current_lang(lang)
+    log_done(t("lang_changed"))
 
 
 def self_test():
@@ -1292,6 +1692,39 @@ def self_test():
         if os.stat(outside_victim_zip_hl).st_ino == os.stat(existing_safe_hl).st_ino:
             raise RuntimeError("Hard link was not broken during zip extraction replace!")
 
+        # 10. Duration Parser & Bilingual Formatter Test
+        if parse_duration("30s") != 30:
+            raise RuntimeError("parse_duration failed on 30s")
+        if parse_duration("15m") != 900:
+            raise RuntimeError("parse_duration failed on 15m")
+        if parse_duration("24h") != 86400:
+            raise RuntimeError("parse_duration failed on 24h")
+        if parse_duration("7d") != 604800:
+            raise RuntimeError("parse_duration failed on 7d")
+        if parse_duration("1y") != 31536000:
+            raise RuntimeError("parse_duration failed on 1y")
+        if parse_duration("1d12h") != 86400 + 43200:
+            raise RuntimeError("parse_duration failed on 1d12h")
+        if parse_duration("  24H  ") != 86400:
+            raise RuntimeError("parse_duration failed on whitespace/case")
+
+        for bad in ["", "0s", "abc", "24x", "-5h", "10"]:
+            try:
+                parse_duration(bad)
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError(f"parse_duration accepted invalid string: {bad}")
+
+        if format_duration(30, lang="id") != "30 detik":
+            raise RuntimeError("format_duration failed on 30s (id)")
+        if format_duration(30, lang="en") != "30 seconds":
+            raise RuntimeError("format_duration failed on 30s (en)")
+        if format_duration(86400, lang="id") != "1 hari":
+            raise RuntimeError("format_duration failed on 86400 (id)")
+        if format_duration(86400, lang="en") != "1 day":
+            raise RuntimeError("format_duration failed on 86400 (en)")
+
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Folder (empty dirs, 0555 readonly & 0755 exec): {C.GREEN}OK{C.RESET}")
@@ -1305,12 +1738,15 @@ def self_test():
     print(f"    {C.GREEN}•{C.RESET} Zip Slip Defense (traversal, write-through & same-name collisions blocked): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Hard Link Defense in Local Encrypt (atomic inode severance): {C.GREEN}OK{C.RESET}")
     print(f"    {C.GREEN}•{C.RESET} Hard Link Defense in ZIP Restore (victim preservation): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Scheduled Backup Duration Parser (s, m, h, d, y): {C.GREEN}OK{C.RESET}")
+    print(f"    {C.GREEN}•{C.RESET} Bilingual Support & Humanizer-ID (ID/EN): {C.GREEN}OK{C.RESET}")
 
 
 def main():
     args = sys.argv[1:]
     force = False
     allow_partial = False
+    local_only = False
 
     if "--force" in args:
         force = True
@@ -1323,54 +1759,154 @@ def main():
         allow_partial = True
         args.remove("--allow-partial")
 
+    if "--local" in args:
+        local_only = True
+        args.remove("--local")
+
+    # Parse --lang parameter
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--lang":
+            if i + 1 < len(args):
+                set_current_lang(args[i + 1])
+                del args[i:i + 2]
+                continue
+            else:
+                log_err("Flag '--lang' membutuhkan nilai 'id' atau 'en'.")
+                sys.exit(1)
+        elif arg.startswith("--lang="):
+            set_current_lang(arg.split("=", 1)[1])
+            del args[i]
+            continue
+        i += 1
+
+    # Parse --time / -t parameter
+    time_interval = None
+    time_arg = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--time", "-t"):
+            if i + 1 < len(args):
+                time_arg = args[i + 1]
+                del args[i:i + 2]
+                continue
+            else:
+                log_err("Flag '--time' / '-t' membutuhkan nilai durasi (contoh: 30s, 24h, 7d, 1y).")
+                sys.exit(1)
+        elif arg.startswith("--time="):
+            time_arg = arg.split("=", 1)[1]
+            del args[i]
+            continue
+        elif arg.startswith("-t="):
+            time_arg = arg.split("=", 1)[1]
+            del args[i]
+            continue
+        i += 1
+
+    if time_arg:
+        try:
+            time_interval = parse_duration(time_arg)
+        except ValueError as e:
+            log_err(str(e))
+            sys.exit(1)
+
     if not args or args[0] in ("-h", "--help"):
-        print(f"\n{C.BOLD}{C.CYAN}  ╔═════════════════════════════════════════════════════════════╗{C.RESET}")
-        print(f"{C.BOLD}{C.CYAN}  ║   GDE - Google Drive Encryption (ChaCha20-Poly1305 256)     ║{C.RESET}")
-        print(f"{C.BOLD}{C.CYAN}  ╚═════════════════════════════════════════════════════════════╝{C.RESET}\n")
-        print(f"{C.BOLD}Penggunaan:{C.RESET}")
-        print(f"  {C.GREEN}gde {C.CYAN}<file/folder>{C.RESET}       Enkripsi & upload ke GDrive (file langsung, folder di-zip)")
-        print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}      Enkripsi lokal -> simpan ke <nama>.enc")
-        print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}  Dekripsi file .enc lokal menggunakan kunci vault")
-        print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                Daftar file di vault & download interaktif")
-        print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET} Download dari GDrive & pulihkan langsung")
-        print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}  Export cadangan kunci vault ke file JSON (chmod 600)")
-        print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}  Import kunci vault dari file JSON")
-        print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                Jalankan internal verification self-test")
-        print(f"  {C.GRAY}Opsi tambahan:{C.RESET}")
-        print(f"    {C.YELLOW}--force / -f{C.RESET}          Lewati konfirmasi penimpaan file saat restore/dekripsi")
-        print(f"    {C.YELLOW}--allow-partial{C.RESET}       Abaikan error file/direktori tak terbaca (exit code 0 alih-alih 2)\n")
+        if CURRENT_LANG == "en":
+            print(f"\n{C.BOLD}{C.CYAN}  ╔═════════════════════════════════════════════════════════════╗{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}  ║   GDE - Google Drive Encryption (ChaCha20-Poly1305 256)     ║{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}  ╚═════════════════════════════════════════════════════════════╝{C.RESET}\n")
+            print(f"{C.BOLD}Usage:{C.RESET}")
+            print(f"  {C.GREEN}gde {C.CYAN}<file/folder>{C.RESET}              Encrypt & upload to GDrive (direct file, zipped folder)")
+            print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}             Local encryption -> save as <name>.enc")
+            print(f"  {C.GREEN}gde {C.CYAN}<path> {C.YELLOW}--time <duration>{C.RESET}     Automatic periodic backup (e.g., 30s, 24h, 7d, 1y)")
+            print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}         Decrypt local .enc file using vault key")
+            print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                       List files in vault & interactive download")
+            print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET}        Download from GDrive & restore directly")
+            print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}         Export vault keys backup to JSON file (chmod 600)")
+            print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}         Import vault keys from backup JSON file")
+            print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}           Set default interface language (ID / EN)")
+            print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                       Run internal verification self-test")
+            print(f"  {C.GRAY}Options:{C.RESET}")
+            print(f"    {C.YELLOW}--time / -t <duration>{C.RESET}      Schedule interval: s (sec), m (min), h (hours), d (days), y (years)")
+            print(f"    {C.YELLOW}--lang <id|en>{C.RESET}              Override language for current command")
+            print(f"    {C.YELLOW}--force / -f{C.RESET}                Skip overwrite confirmation prompt")
+            print(f"    {C.YELLOW}--allow-partial{C.RESET}             Ignore unreadable file errors (exit code 0 instead of 2)\n")
+        else:
+            print(f"\n{C.BOLD}{C.CYAN}  ╔═════════════════════════════════════════════════════════════╗{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}  ║   GDE - Google Drive Encryption (ChaCha20-Poly1305 256)     ║{C.RESET}")
+            print(f"{C.BOLD}{C.CYAN}  ╚═════════════════════════════════════════════════════════════╝{C.RESET}\n")
+            print(f"{C.BOLD}Penggunaan:{C.RESET}")
+            print(f"  {C.GREEN}gde {C.CYAN}<file/folder>{C.RESET}              Enkripsi & upload ke GDrive (file langsung, folder di-zip)")
+            print(f"  {C.GREEN}gde {C.YELLOW}--local <path>{C.RESET}             Enkripsi lokal -> simpan ke <nama>.enc")
+            print(f"  {C.GREEN}gde {C.CYAN}<path> {C.YELLOW}--time <durasi>{C.RESET}     Backup berjadwal otomatis (misal: 30s, 24h, 7d, 1y)")
+            print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}         Dekripsi file .enc lokal pakai kunci vault")
+            print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                       Daftar file di vault & download interaktif")
+            print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET}        Download dari GDrive & restore langsung")
+            print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}         Export cadangan kunci vault ke file JSON (chmod 600)")
+            print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}         Import kunci vault dari file backup JSON")
+            print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}           Ubah bahasa tampilan default (ID / EN)")
+            print(f"  {C.GREEN}gde {C.GRAY}test{C.RESET}                       Jalankan internal verification self-test")
+            print(f"  {C.GRAY}Opsi tambahan:{C.RESET}")
+            print(f"    {C.YELLOW}--time / -t <durasi>{C.RESET}         Interval jadwal: s (detik), m (menit), h (jam), d (hari), y (tahun)")
+            print(f"    {C.YELLOW}--lang <id|en>{C.RESET}              Override bahasa untuk perintah ini")
+            print(f"    {C.YELLOW}--force / -f{C.RESET}                 Lewati konfirmasi penimpaan file saat restore/dekripsi")
+            print(f"    {C.YELLOW}--allow-partial{C.RESET}              Abaikan error file/folder tak terbaca (exit code 0 alih-alih 2)\n")
         sys.exit(0)
 
     cmd = args[0]
     if cmd == "list":
+        if time_interval is not None:
+            log_err("Flag '--time' tidak berlaku untuk perintah 'list'.")
+            sys.exit(1)
         cmd_list()
     elif cmd == "download":
+        if time_interval is not None:
+            log_err("Flag '--time' tidak berlaku untuk perintah 'download'.")
+            sys.exit(1)
         if len(args) < 2:
             log_err("Berikan ID atau Label file.")
             sys.exit(1)
         cmd_download(args[1], force=force)
     elif cmd == "decrypt":
+        if time_interval is not None:
+            log_err("Flag '--time' tidak berlaku untuk perintah 'decrypt'.")
+            sys.exit(1)
         if len(args) < 2:
             log_err("Berikan path ke file .enc (contoh: gde decrypt dokumen.md.enc)")
             sys.exit(1)
         cmd_decrypt_file(args[1], force=force)
     elif cmd == "export-keys":
+        if time_interval is not None:
+            log_err("Flag '--time' tidak berlaku untuk perintah 'export-keys'.")
+            sys.exit(1)
         out_file = args[1] if len(args) > 1 else None
         cmd_export_keys(out_file)
     elif cmd == "import-keys":
+        if time_interval is not None:
+            log_err("Flag '--time' tidak berlaku untuk perintah 'import-keys'.")
+            sys.exit(1)
         if len(args) < 2:
             log_err("Berikan path file JSON backup.")
             sys.exit(1)
         cmd_import_keys(args[1])
-    elif cmd == "test":
-        self_test()
-    elif cmd == "--local":
+    elif cmd == "set-lang":
         if len(args) < 2:
-            log_err("Berikan path file/folder.")
+            log_err("Berikan kode bahasa: 'id' atau 'en' / Provide language code: 'id' or 'en'")
             sys.exit(1)
-        cmd_encrypt(args[1], local_only=True, force=force, allow_partial=allow_partial)
+        cmd_set_lang(args[1])
+    elif cmd == "test":
+        if time_interval is not None:
+            log_err("Flag '--time' tidak berlaku untuk perintah 'test'.")
+            sys.exit(1)
+        self_test()
     else:
-        cmd_encrypt(cmd, local_only=False, force=force, allow_partial=allow_partial)
+        # Default: encrypt / backup target
+        if time_interval is not None:
+            run_scheduled_backup(cmd, time_interval, local_only=local_only, force=force, allow_partial=allow_partial)
+        else:
+            cmd_encrypt(cmd, local_only=local_only, force=force, allow_partial=allow_partial)
 
 
 if __name__ == "__main__":

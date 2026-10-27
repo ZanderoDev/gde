@@ -189,6 +189,36 @@ gde download 1
 gde download gde_febb82b998aa27ca
 ```
 
+### Backup Berjadwal Otomatis (`--time` / `-t`)
+Jalankan backup otomatis secara berkala untuk folder atau file. GDE akan mengeksekusi siklus pertama segera, lalu otomatis mengulang proses backup sesuai interval waktu yang ditentukan.
+
+Format durasi waktu mendukung:
+- `s` : detik (seconds)
+- `m` : menit (minutes)
+- `h` : jam (hours)
+- `d` : hari (days)
+- `y` : tahun (years)
+
+Bisa juga menggunakan kombinasi (misalnya `1d12h` atau `1h30m`).
+
+```bash
+# Backup folder Dokumen ke Google Drive otomatis setiap 24 jam
+gde ~/Dokumen --time 24h
+
+# Backup folder ke Google Drive setiap 7 hari
+gde ~/Dokumen -t 7d
+
+# Backup folder ke Google Drive setiap 1 tahun
+gde ~/ArsipTahunan --time 1y
+
+# Backup mode lokal setiap 12 jam
+gde --local ~/Dokumen -t 12h
+
+# Testing interval cepat (misal: setiap 30 detik)
+gde ~/Dokumen --time 30s
+```
+> Tekan `Ctrl+C` kapan saja untuk menghentikan penjadwal backup.
+
 ### Mode Offline / Enkripsi Lokal Saja
 Kalau cuma mau enkripsi lokal tanpa upload ke GDrive:
 ```bash
@@ -213,6 +243,21 @@ gde export-keys cadangan-kunci.json
 gde import-keys cadangan-kunci.json
 ```
 > **Catatan:** File export berisi kunci plaintext. Pastikan disimpan di media penyimpanan yang aman (misalnya drive terenkripsi/LUKS).
+
+### Pengaturan Bahasa / Language Settings (`set-lang` & `--lang`)
+GDE mendukung dua bahasa: **Bahasa Indonesia (ID)** dan **English (EN)**.
+
+Saat pertama kali menjalankan `./install.sh`, installer akan menawarkan pilihan bahasa instalasi dan menyimpannya ke konfigurasi lokal. Anda juga bisa mengganti bahasa kapan saja:
+```bash
+# Ubah bahasa tampilan default ke English
+gde set-lang en
+
+# Ubah kembali ke Bahasa Indonesia
+gde set-lang id
+
+# Override bahasa per-perintah
+gde --lang en list
+```
 
 ### Opsi Tambahan
 
