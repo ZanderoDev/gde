@@ -233,26 +233,6 @@ gde download 1
 gde download gde_febb82b998aa27ca
 ```
 
-### Hapus File dari Vault dan Google Drive (`rm` / `delete`)
-
-Kamu bisa hapus entri file dari database vault lokal sekaligus menghapus file terenkripsinya di Google Drive:
-
-```bash
-# Hapus berdasarkan ID atau Label (minta konfirmasi)
-gde rm 6
-
-# Hapus beberapa file sekaligus
-gde rm 6 7 8
-
-# Hapus tanpa konfirmasi prompt
-gde rm 6 --force
-
-# Hapus dari vault lokal saja (biarkan file tetap aman di Google Drive)
-gde rm 6 --local
-```
-
-Bisa juga langsung dari prompt interaktif `gde list` dengan mengetik `rm <No>` (contoh: `rm 6` atau `rm 6 7 8`).
-
 ### Backup Berjadwal Otomatis (`--time` / `-t`)
 
 Backup folder atau file secara berkala. GDE menjalankan siklus pertama langsung, lalu mengulanginya sesuai interval yang kamu tentukan.

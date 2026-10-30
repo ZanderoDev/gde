@@ -293,13 +293,7 @@ T = {
         "col_gdrive": "GDrive ID",
         "col_time": "Waktu",
         "col_local": "Lokal",
-        "list_prompt": "Masukkan No untuk restore, 'rm <No>' untuk hapus (atau 'q' keluar): ",
-        "del_no_target": "Berikan No ID atau Label file yang ingin dihapus.",
-        "del_item_not_found": "Entri '{target}' tidak ditemukan di vault.",
-        "del_confirm_prompt": "Hapus entri '{name}' (ID: {id}) dari vault?",
-        "del_remote_start": "Menghapus file di Google Drive (ID: {id})...",
-        "del_remote_success": "File di Google Drive (ID: {id}) berhasil dipindahkan ke sampah.",
-        "del_success": "Entri '{name}' (ID: {id}) berhasil dihapus dari vault.",
+        "list_prompt": "Masukkan No file untuk download & restore (atau 'q' keluar): ",
         "invalid_number_err": "Input nggak valid: Masukkan angka nomor file.",
         "item_not_found": "Data '{item}' nggak ketemu di vault.",
         "download_process": "Memproses download: {name} (Label: {label}, Tipe: {type})",
@@ -398,13 +392,7 @@ T = {
         "col_gdrive": "GDrive ID",
         "col_time": "Time",
         "col_local": "Local",
-        "list_prompt": "Enter No to download, 'rm <No>' to delete (or 'q' to quit): ",
-        "del_no_target": "Provide ID or label of item to delete.",
-        "del_item_not_found": "Item '{target}' not found in vault.",
-        "del_confirm_prompt": "Delete entry '{name}' (ID: {id}) from vault?",
-        "del_remote_start": "Deleting file from Google Drive (ID: {id})...",
-        "del_remote_success": "File in Google Drive (ID: {id}) moved to trash.",
-        "del_success": "Entry '{name}' (ID: {id}) deleted from vault.",
+        "list_prompt": "Enter file No to download & restore (or 'q' to quit): ",
         "invalid_number_err": "Invalid input: Please enter a file number.",
         "item_not_found": "Item '{item}' was not found in the vault.",
         "download_process": "Processing download: {name} (Label: {label}, Type: {type})",
@@ -763,11 +751,6 @@ class GDriveMCP:
             msg = "".join(c.get("text", "") for c in result.get("content", []))
             raise RuntimeError(f"Tool Error: {msg}")
         return result
-
-    def delete_file(self, file_id):
-        self.call_tool("deleteItem", {
-            "itemId": str(file_id)
-        })
 
     def upload_file(self, local_path, remote_name):
         res = self.call_tool("uploadFile", {
@@ -1494,13 +1477,6 @@ def cmd_list():
         pilihan = input(f"\n{C.BOLD}{C.CYAN}{t('list_prompt')}{C.RESET}").strip()
         if not pilihan or pilihan.lower() == "q":
             return
-        lower_p = pilihan.lower()
-        if lower_p.startswith("rm ") or lower_p.startswith("d ") or lower_p.startswith("del "):
-            after_cmd = pilihan[pilihan.find(" "):].strip()
-            parts = [p.strip() for p in re.split(r"[\s,]+", after_cmd) if p.strip()]
-            if parts:
-                cmd_delete(parts)
-            return
         item_id = int(pilihan)
     except KeyboardInterrupt:
         print(f"\n{t('cancelled_by_user')}")
@@ -1510,80 +1486,6 @@ def cmd_list():
         return
 
     cmd_download(item_id)
-
-
-def cmd_delete(item_ids_or_labels, delete_remote=True, force=False, conn_override=None):
-    """Delete one or more entries from the local vault, and optionally from Google Drive."""
-    if not item_ids_or_labels:
-        log_err(t("del_no_target"))
-        return 1
-
-    conn = conn_override or init_db()
-    cur = conn.cursor()
-
-    if isinstance(item_ids_or_labels, (str, int)):
-        targets = [str(item_ids_or_labels)]
-    else:
-        targets = [str(x) for x in item_ids_or_labels]
-
-    success_count = 0
-    mcp = None
-
-    try:
-        for t_val in targets:
-            clean_t = t_val.strip()
-            if not clean_t:
-                continue
-
-            if clean_t.isdigit():
-                cur.execute("SELECT id, label, original_name, drive_file_id FROM vault WHERE id = ?", (int(clean_t),))
-            else:
-                cur.execute("SELECT id, label, original_name, drive_file_id FROM vault WHERE label = ? OR original_name = ?", (clean_t, clean_t))
-
-            rows = cur.fetchall()
-            if not rows:
-                log_warn(t("del_item_not_found", target=clean_t))
-                continue
-
-            for row in rows:
-                fid, label, name, drive_id = row
-                prompt_msg = t("del_confirm_prompt", name=f"{C.BOLD}{name}{C.RESET}", id=fid)
-                if not force:
-                    try:
-                        ans = input(f"{C.YELLOW}[?]{C.RESET} {prompt_msg} [y/N]: ").strip().lower()
-                    except KeyboardInterrupt:
-                        print(f"\n{t('cancelled_by_user')}")
-                        return 1
-                    if ans not in ("y", "yes"):
-                        log_info(t("cancelled_by_user"))
-                        continue
-
-                # Delete from Google Drive if present and requested
-                if drive_id and delete_remote:
-                    if not mcp:
-                        mcp = GDriveMCP()
-                        try:
-                            mcp.start()
-                        except Exception as e:
-                            log_warn(f"GDrive MCP connection error: {e}")
-                            mcp = None
-                    if mcp:
-                        try:
-                            log_info(t("del_remote_start", id=f"{C.CYAN}{drive_id}{C.RESET}"))
-                            mcp.delete_file(drive_id)
-                            log_success(t("del_remote_success", id=f"{C.GREEN}{drive_id}{C.RESET}"))
-                        except Exception as e:
-                            log_warn(f"Google Drive delete warning: {e}")
-
-                conn.execute("DELETE FROM vault WHERE id = ?", (fid,))
-                conn.commit()
-                log_done(t("del_success", name=f"{C.BOLD}{name}{C.RESET}", id=fid))
-                success_count += 1
-    finally:
-        if mcp:
-            mcp.close()
-
-    return 0 if success_count > 0 else 1
 
 
 def cmd_download(item_id_or_label, dest_dir=".", force=False, conn_override=None):
@@ -1983,25 +1885,6 @@ class GdeMCPServer:
             }
         },
         {
-            "name": "gde_delete",
-            "description": "Delete a file or folder entry from local vault and optionally trash it from Google Drive.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "item_id_or_label": {
-                        "type": "string",
-                        "description": "Vault ID (e.g. '1'), label (e.g. 'gde_abcd1234ef567890'), or original file name"
-                    },
-                    "delete_remote": {
-                        "type": "boolean",
-                        "description": "Whether to also delete the file from Google Drive (default True)",
-                        "default": True
-                    }
-                },
-                "required": ["item_id_or_label"]
-            }
-        },
-        {
             "name": "gde_import_keys",
             "description": "Import encryption keys from a backup JSON file into local vault.",
             "inputSchema": {
@@ -2105,7 +1988,7 @@ class GdeMCPServer:
             }
 
     def _dispatch_tool(self, name: str, args: dict, conn_override=None):
-        if self.readonly and name in ("gde_encrypt", "gde_decrypt", "gde_download", "gde_import_keys", "gde_delete"):
+        if self.readonly and name in ("gde_encrypt", "gde_decrypt", "gde_download", "gde_import_keys"):
             raise PermissionError(f"GDE MCP Server is running in read-only mode. Mutation tool '{name}' is blocked.")
 
         if name == "gde_encrypt":
@@ -2151,15 +2034,6 @@ class GdeMCPServer:
             if not in_path:
                 raise ValueError("Argument 'in_path' is required.")
             return self._tool_import_keys(in_path, conn_override=conn_override)
-        elif name == "gde_delete":
-            item = args.get("item_id_or_label")
-            if not item:
-                raise ValueError("Argument 'item_id_or_label' is required.")
-            delete_remote = bool(args.get("delete_remote", True))
-            rc = cmd_delete([str(item)], delete_remote=delete_remote, force=True, conn_override=conn_override)
-            if rc != 0:
-                raise RuntimeError(f"Gagal menghapus entri vault untuk: {item}")
-            return {"status": "success", "message": f"Vault item '{item}' successfully deleted."}
 
         else:
             raise ValueError(f"Unknown tool name: {name}")
@@ -3008,7 +2882,7 @@ def self_test():
         # 11c. MCP tools/list
         tools_res = mcp_server.handle_request({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}, conn_override=test_conn)
         tool_names = [t["name"] for t in tools_res.get("result", {}).get("tools", [])]
-        for expected_tool in ["gde_encrypt", "gde_decrypt", "gde_list", "gde_download", "gde_status", "gde_export_keys", "gde_import_keys", "gde_delete"]:
+        for expected_tool in ["gde_encrypt", "gde_decrypt", "gde_list", "gde_download", "gde_status", "gde_export_keys", "gde_import_keys"]:
             if expected_tool not in tool_names:
                 raise RuntimeError(f"MCP tool '{expected_tool}' missing from tools/list")
 
@@ -3183,22 +3057,6 @@ def self_test():
         if not bad_tool_res.get("result", {}).get("isError"):
             raise RuntimeError(f"MCP unknown tool did not return isError=True: {bad_tool_res}")
 
-        # 11h. MCP gde_delete tool
-        del_tool_res = mcp_server.handle_request({
-            "jsonrpc": "2.0",
-            "id": 10,
-            "method": "tools/call",
-            "params": {
-                "name": "gde_delete",
-                "arguments": {
-                    "item_id_or_label": enc_result["label"],
-                    "delete_remote": False
-                }
-            }
-        }, conn_override=test_conn)
-        if del_tool_res.get("result", {}).get("isError"):
-            raise RuntimeError(f"MCP gde_delete failed: {del_tool_res}")
-
         # 12. Scheduled Local Backup Versioning & No-Orphan-Key Test
         sched_test_file = tmp / "sched_data.txt"
         sched_test_file.write_text("Versi 1", encoding="utf-8")
@@ -3216,17 +3074,10 @@ def self_test():
         count_vault = cur.fetchone()[0]
         if count_vault < 2:
             raise RuntimeError(f"Vault entries missing for versioned scheduled backups: {count_vault}")
-        try:
-            # 13. Production cmd_delete test
-            cmd_delete(["sched_data.txt"], delete_remote=False, force=True, conn_override=test_conn)
-            cur.execute("SELECT count(*) FROM vault WHERE original_name = 'sched_data.txt'")
-            if cur.fetchone()[0] != 0:
-                raise RuntimeError("cmd_delete failed to remove items from vault")
-        finally:
-            if v1_path.exists():
-                v1_path.unlink()
-            if v2_path.exists():
-                v2_path.unlink()
+        if v1_path.exists():
+            v1_path.unlink()
+        if v2_path.exists():
+            v2_path.unlink()
 
     log_done("Self-test lolos:")
     print(f"    {C.GREEN}•{C.RESET} Single file (direct encrypt, no zip): {C.GREEN}OK{C.RESET}")
@@ -3338,7 +3189,6 @@ def main():
             print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}          Decrypt local .enc file using vault key")
             print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                        List files in vault & interactive download")
             print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET}         Download from GDrive & restore directly")
-            print(f"  {C.GREEN}gde {C.RED}rm <id|label> ...{C.RESET}           Delete entry from vault & Google Drive")
             print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}          Export vault keys backup to JSON file (chmod 600)")
             print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}          Import vault keys from backup JSON file")
             print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}            Set default interface language (ID / EN)")
@@ -3361,7 +3211,6 @@ def main():
             print(f"  {C.GREEN}gde {C.CYAN}decrypt <file.enc>{C.RESET}          Dekripsi file .enc lokal pakai kunci vault")
             print(f"  {C.GREEN}gde {C.MAGENTA}list{C.RESET}                        Daftar file di vault & download interaktif")
             print(f"  {C.GREEN}gde {C.BLUE}download <id|label>{C.RESET}         Download dari GDrive & restore langsung")
-            print(f"  {C.GREEN}gde {C.RED}rm <id|label> ...{C.RESET}           Hapus file dari vault & Google Drive")
             print(f"  {C.GREEN}gde {C.YELLOW}export-keys [file]{C.RESET}          Export cadangan kunci vault ke file JSON (chmod 600)")
             print(f"  {C.GREEN}gde {C.YELLOW}import-keys <file>{C.RESET}          Import kunci vault dari file backup JSON")
             print(f"  {C.GREEN}gde {C.YELLOW}set-lang <id|en>{C.RESET}            Ubah bahasa tampilan default (ID / EN)")
@@ -3389,15 +3238,6 @@ def main():
             log_err("Berikan ID atau Label file.")
             sys.exit(1)
         cmd_download(args[1], force=force)
-    elif cmd in ("rm", "delete", "del"):
-        if time_interval is not None:
-            log_err("Flag '--time' tidak berlaku untuk perintah hapus.")
-            sys.exit(1)
-        if len(args) < 2:
-            log_err(t("del_no_target"))
-            sys.exit(1)
-        delete_remote = not local_only
-        sys.exit(cmd_delete(args[1:], delete_remote=delete_remote, force=force))
     elif cmd == "decrypt":
         if time_interval is not None:
             log_err("Flag '--time' tidak berlaku untuk perintah 'decrypt'.")

@@ -233,26 +233,6 @@ gde download 1
 gde download gde_febb82b998aa27ca
 ```
 
-### Delete File from Vault and Google Drive (`rm` / `delete`)
-
-Delete entries from your local vault database and optionally move the encrypted file in Google Drive to trash:
-
-```bash
-# Delete by ID or Label (prompts for confirmation)
-gde rm 6
-
-# Delete multiple entries at once
-gde rm 6 7 8
-
-# Force delete without confirmation prompt
-gde rm 6 --force
-
-# Delete from local vault only (keep file safe in Google Drive)
-gde rm 6 --local
-```
-
-You can also delete directly from the interactive `gde list` prompt by typing `rm <No>` (e.g. `rm 6` or `rm 6 7 8`).
-
 ### Scheduled Automatic Backup (`--time` / `-t`)
 
 Schedule automated recurring backups for files or directories. GDE runs the first cycle immediately, then repeats automatically according to your specified interval.
