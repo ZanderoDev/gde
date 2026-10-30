@@ -56,7 +56,7 @@ Prinsipnya **zero-knowledge**: Google cuma nerima blob ciphertext acak (`gde_<la
 - **Anti-tampering**: label file terikat ke AAD (Additional Authenticated Data). Kalau isi file atau labelnya diubah, tag Poly1305 langsung menolak dekripsi.
 - **Vault lokal dan backup kunci**: SQLite lokal disimpan dengan permission ketat (`chmod 600`). Ada perintah `export-keys` dan `import-keys` buat backup atau migrasi kunci.
 - **Deteksi akses dan peringatan**: file atau folder yang nggak bisa dibaca (`PermissionError`) dan file khusus (FIFO/device) dideteksi lalu dilaporkan secara eksplisit. Backup parsial berakhir dengan exit code 2 kecuali kamu pakai `--allow-partial`.
-- **Tampilan CLI rapi**: output tabel berwarna dengan opsi download interaktif.
+- **Tampilan proses modern**: panel ringkasan, spinner dengan waktu berjalan, progress bar saat kompres folder, tabel vault, dan hitung mundur backup berjadwal (pakai [Rich](https://github.com/Textualize/rich), opsional: `pip install rich`). Otomatis kembali ke teks biasa kalau Rich nggak terpasang, output di-pipe/cron, `NO_COLOR` diset, atau mode MCP. Catatan: upload/download Google Drive lewat MCP itu satu panggilan tanpa laporan byte, jadi tahap itu menampilkan spinner dan waktu, bukan persentase.
 - **Server MCP bawaan buat AI agent**: mendukung Model Context Protocol (`2024-11-05`) lewat stdio JSON-RPC. AI agent (Claude Desktop, Cursor, Antigravity, Cline) bisa langsung ngatur enkripsi, dekripsi, dan sinkronisasi vault.
 - **Native MCP integration**: komunikasi langsung ke runner Google Drive MCP lewat stdio JSON-RPC, jadi aman dari polusi log stdout.
 
@@ -232,6 +232,26 @@ gde download 1
 # atau
 gde download gde_febb82b998aa27ca
 ```
+
+### Hapus File dari Vault dan Google Drive (`rm` / `delete`)
+
+Kamu bisa hapus entri file dari database vault lokal sekaligus menghapus file terenkripsinya di Google Drive:
+
+```bash
+# Hapus berdasarkan ID atau Label (minta konfirmasi)
+gde rm 6
+
+# Hapus beberapa file sekaligus
+gde rm 6 7 8
+
+# Hapus tanpa konfirmasi prompt
+gde rm 6 --force
+
+# Hapus dari vault lokal saja (biarkan file tetap aman di Google Drive)
+gde rm 6 --local
+```
+
+Bisa juga langsung dari prompt interaktif `gde list` dengan mengetik `rm <No>` (contoh: `rm 6` atau `rm 6 7 8`).
 
 ### Backup Berjadwal Otomatis (`--time` / `-t`)
 

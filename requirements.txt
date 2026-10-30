@@ -1,1 +1,3 @@
 cryptography>=41.0.0
+# Opsional: tampilan proses modern (progress bar, panel, tabel). Tanpa ini GDE tetap jalan dengan teks biasa.
+rich>=13.0.0

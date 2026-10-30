@@ -56,7 +56,7 @@ Built on **zero-knowledge** principles: Google only receives random ciphertext b
 - **Anti-Tampering**: File labels are bound to AAD (Additional Authenticated Data). Any manipulation of ciphertext or label header causes Poly1305 verification to fail and reject decryption.
 - **Local Vault & Key Backup**: Local SQLite database stored with strict permissions (`chmod 600`). Includes `export-keys` and `import-keys` commands for key backup and migration.
 - **Access Detection & Warnings**: Unreadable files (`PermissionError`) and special devices (FIFOs, sockets) are detected and explicitly reported (exit code 2 on partial backup unless `--allow-partial`).
-- **Clean CLI Interface**: Formatted colored tables with interactive download prompts.
+- **Modern process UI**: summary panels, spinners with elapsed time, a real progress bar while compressing folders, a vault table, and a countdown for scheduled backups (powered by [Rich](https://github.com/Textualize/rich), optional: `pip install rich`). Automatically falls back to plain text when Rich is missing, output is piped/cron, `NO_COLOR` is set, or in MCP mode. Note: Google Drive upload/download over MCP is a single call with no byte-level reporting, so that stage shows a spinner and elapsed time rather than a percentage.
 - **Built-in MCP Server for AI Agents**: Full Model Context Protocol (`2024-11-05`) support via stdio JSON-RPC. AI agents (Claude Desktop, Cursor, Antigravity, Cline) can directly manage encryption, decryption, downloads, and vault status.
 - **Native MCP Integration**: Direct stdio JSON-RPC communication with upstream Google Drive MCP runner (resilient against stdout log pollution).
 
@@ -232,6 +232,26 @@ gde download 1
 # or
 gde download gde_febb82b998aa27ca
 ```
+
+### Delete File from Vault and Google Drive (`rm` / `delete`)
+
+Delete entries from your local vault database and optionally move the encrypted file in Google Drive to trash:
+
+```bash
+# Delete by ID or Label (prompts for confirmation)
+gde rm 6
+
+# Delete multiple entries at once
+gde rm 6 7 8
+
+# Force delete without confirmation prompt
+gde rm 6 --force
+
+# Delete from local vault only (keep file safe in Google Drive)
+gde rm 6 --local
+```
+
+You can also delete directly from the interactive `gde list` prompt by typing `rm <No>` (e.g. `rm 6` or `rm 6 7 8`).
 
 ### Scheduled Automatic Backup (`--time` / `-t`)
 

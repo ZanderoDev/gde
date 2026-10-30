@@ -74,6 +74,9 @@ if [ "$SELECTED_LANG" = "en" ]; then
     MSG_CHECK_CRYPTO="Checking 'cryptography' library..."
     MSG_INSTALL_CRYPTO="Installing 'cryptography' module..."
     MSG_CRYPTO_READY="'cryptography' library is ready."
+    MSG_CHECK_RICH="Checking optional 'rich' library (modern UI)..."
+    MSG_RICH_READY="'rich' library is ready (modern UI enabled)."
+    MSG_RICH_SKIP="'rich' could not be installed. GDE still works with the plain text UI."
     MSG_INSTALLING_BIN="Installing binary to %s/gde..."
     MSG_NO_SCRIPT="Source file 'gde' not found at %s!"
     MSG_PATH_WARN="%s is not in your \$PATH yet."
@@ -100,6 +103,9 @@ else
     MSG_CHECK_CRYPTO="Cek library 'cryptography'..."
     MSG_INSTALL_CRYPTO="Pasang modul 'cryptography'..."
     MSG_CRYPTO_READY="Library cryptography udah siap."
+    MSG_CHECK_RICH="Cek library opsional 'rich' (tampilan modern)..."
+    MSG_RICH_READY="Library rich udah siap (tampilan modern aktif)."
+    MSG_RICH_SKIP="'rich' gagal dipasang. GDE tetap jalan dengan tampilan teks biasa."
     MSG_INSTALLING_BIN="Pasang binary ke %s/gde..."
     MSG_NO_SCRIPT="File sumber 'gde' nggak ketemu di %s!"
     MSG_PATH_WARN="%s belum ada di \$PATH kamu."
@@ -145,6 +151,17 @@ if ! python3 -c "from cryptography.hazmat.primitives.ciphers.aead import ChaCha2
     pip3 install --user cryptography || pip install --user cryptography || pip3 install cryptography --break-system-packages
 fi
 echo -e "${GREEN}[+] $MSG_CRYPTO_READY${RESET}"
+
+# 3b. Optional: Rich (modern UI). Non-fatal: GDE falls back to plain text without it.
+echo -e "${CYAN}[*] $MSG_CHECK_RICH${RESET}"
+if ! python3 -c "import rich" &>/dev/null; then
+    pip3 install --user rich &>/dev/null || pip install --user rich &>/dev/null || pip3 install rich --break-system-packages &>/dev/null || true
+fi
+if python3 -c "import rich" &>/dev/null; then
+    echo -e "${GREEN}[+] $MSG_RICH_READY${RESET}"
+else
+    echo -e "${YELLOW}[!] $MSG_RICH_SKIP${RESET}"
+fi
 
 # 4. Install gde binary
 INSTALL_DIR="$HOME/.local/bin"
